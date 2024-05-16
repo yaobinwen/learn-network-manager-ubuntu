@@ -1,0 +1,50 @@
+From f03ae35593f1ac1c1c717ac06b9076ee5e046783 Mon Sep 17 00:00:00 2001
+From: Beniamino Galvani <bgalvani@redhat.com>
+Date: Tue, 8 May 2018 14:05:22 +0200
+Subject: [PATCH] device: start IP configuration when master carrier goes up
+
+If the master has no carrier in act_stage3_ip6_config_start(), we set
+IP state WAIT and wait until carrier goes up before starting IP
+configuration.
+
+However, in carrier_changed() if the device state is ACTIVATED we only
+call nm_device_update_dynamic_ip_setup(), which just restarts DHCP if
+it was already running.
+
+Let's also ensure that we start IP configuration if the IP state is
+WAIT.
+
+Fixes: b0f6baad90a3d8b571a56cc255ad49d9fa26d874
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1575944
+(cherry picked from commit 1829126f3abe8af591af2d0906f04b3dae01743e)
+---
+ src/devices/nm-device.c | 12 ++++++------
+ 1 file changed, 6 insertions(+), 6 deletions(-)
+
+Origin: upstream, https://gitlab.freedesktop.org/NetworkManager/NetworkManager/commit/f03ae35593f1ac1c1c717ac06b9076ee5e046783
+Bug-Redhat: https://bugzilla.redhat.com/show_bug.cgi?id=1575944
+Bug-Ubuntu: https://bugs.launchpad.net/ubuntu/+source/network-manager/+bug/1794478
+Index: network-manager-1.10.6/src/devices/nm-device.c
+===================================================================
+--- network-manager-1.10.6.orig/src/devices/nm-device.c
++++ network-manager-1.10.6/src/devices/nm-device.c
+@@ -2452,12 +2452,12 @@ carrier_changed (NMDevice *self, gboolea
+ 			* is restored. */
+ 			if (priv->state == NM_DEVICE_STATE_ACTIVATED)
+ 				nm_device_update_dynamic_ip_setup (self);
+-			else {
+-				if (nm_device_activate_ip4_state_in_wait (self))
+-					nm_device_activate_stage3_ip4_start (self);
+-				if (nm_device_activate_ip6_state_in_wait (self))
+-					nm_device_activate_stage3_ip6_start (self);
+-			}
++			/* If needed, also resume IP configuration that is
++			 * waiting for carrier. */
++			if (nm_device_activate_ip4_state_in_wait (self))
++				nm_device_activate_stage3_ip4_start (self);
++			if (nm_device_activate_ip6_state_in_wait (self))
++				nm_device_activate_stage3_ip6_start (self);
+ 			return;
+ 		}
+ 		/* fall-through and change state of device */

@@ -1,0 +1,3427 @@
+Description: Fix unencrypted DNS queries leaked outside full-tunnel
+ This is a backport of the master fix altered for nm-1.10 branch.
+ .
+ network-manager (1.10.6-2ubuntu1.2) bionic; urgency=medium
+ .
+   * W.I.P.
+Origin: upstream, https://cgit.freedesktop.org/NetworkManager/NetworkManager/commit/?id=1e486a721de1fec76c81bfc461671a7fbdae531b
+Bug: 746422
+Bug-Ubuntu: https://launchpad.net/bugs/746422
+
+--- network-manager-1.10.6.orig/Makefile.am
++++ network-manager-1.10.6/Makefile.am
+@@ -1465,16 +1465,16 @@ src_libNetworkManager_la_SOURCES = \
+ 	src/dhcp/nm-dhcp-dhclient-utils.c \
+ 	src/dhcp/nm-dhcp-dhclient-utils.h \
+ 	\
++	src/dns/nm-dns-manager.c \
++	src/dns/nm-dns-manager.h \
++	src/dns/nm-dns-plugin.c \
++	src/dns/nm-dns-plugin.h \
+ 	src/dns/nm-dns-dnsmasq.c \
+ 	src/dns/nm-dns-dnsmasq.h \
+ 	src/dns/nm-dns-systemd-resolved.c \
+ 	src/dns/nm-dns-systemd-resolved.h \
+ 	src/dns/nm-dns-unbound.c \
+ 	src/dns/nm-dns-unbound.h \
+-	src/dns/nm-dns-manager.c \
+-	src/dns/nm-dns-manager.h \
+-	src/dns/nm-dns-plugin.c \
+-	src/dns/nm-dns-plugin.h \
+ 	\
+ 	src/dnsmasq/nm-dnsmasq-manager.c \
+ 	src/dnsmasq/nm-dnsmasq-manager.h \
+@@ -4550,6 +4550,7 @@ EXTRA_DIST += \
+ 	shared/nm-utils/c-list-util.c \
+ 	shared/nm-utils/c-list-util.h \
+ 	shared/nm-utils/gsystem-local-alloc.h \
++	shared/nm-utils/nm-c-list.h \
+ 	shared/nm-utils/nm-glib.h \
+ 	shared/nm-utils/nm-obj.h \
+ 	shared/nm-utils/nm-macros-internal.h \
+--- network-manager-1.10.6.orig/clients/common/nm-meta-setting-desc.c
++++ network-manager-1.10.6/clients/common/nm-meta-setting-desc.c
+@@ -5603,6 +5603,14 @@ static const NMMetaPropertyInfo *const p
+ 			                            | NM_META_PROPERTY_TYP_FLAG_ENUM_GET_PRETTY_TEXT,
+ 		),
+ 	),
++	PROPERTY_INFO_WITH_DESC (NM_SETTING_CONNECTION_MDNS,
++		.property_type =                &_pt_gobject_enum,
++		.property_typ_data = DEFINE_PROPERTY_TYP_DATA (
++			PROPERTY_TYP_DATA_SUBTYPE (gobject_enum,
++				.get_gtype =            nm_setting_connection_mdns_get_type,
++			),
++		),
++	),
+ 	NULL
+ };
+ 
+--- network-manager-1.10.6.orig/clients/common/settings-docs.c.in
++++ network-manager-1.10.6/clients/common/settings-docs.c.in
+@@ -144,6 +144,7 @@
+ #define DESCRIBE_DOC_NM_SETTING_CONNECTION_INTERFACE_NAME N_("The name of the network interface this connection is bound to. If not set, then the connection can be attached to any interface of the appropriate type (subject to restrictions imposed by other settings). For software devices this specifies the name of the created device. For connection types where interface names cannot easily be made persistent (e.g. mobile broadband or USB Ethernet), this property should not be used. Setting this property restricts the interfaces a connection can be used with, and if interface names change or are reordered the connection may be applied to the wrong interface.")
+ #define DESCRIBE_DOC_NM_SETTING_CONNECTION_LLDP N_("Whether LLDP is enabled for the connection.")
+ #define DESCRIBE_DOC_NM_SETTING_CONNECTION_MASTER N_("Interface name of the master device or UUID of the master connection.")
++#define DESCRIBE_DOC_NM_SETTING_CONNECTION_MDNS N_("Whether mDNS is enabled for the connection. The permitted values are: yes: register hostname and resolving for the connection, no: disable mDNS for the interface, resolve: do not register hostname but allow resolving of mDNS host names. When updating this property on a currently activated connection, the change takes effect immediately. This feature requires a plugin which supports mDNS. One such plugin is dns-systemd-resolved.")
+ #define DESCRIBE_DOC_NM_SETTING_CONNECTION_METERED N_("Whether the connection is metered. When updating this property on a currently activated connection, the change takes effect immediately.")
+ #define DESCRIBE_DOC_NM_SETTING_CONNECTION_NAME N_("The setting's name, which uniquely identifies the setting within the connection.  Each setting type has a name unique to that type, for example \"ppp\" or \"wireless\" or \"wired\".")
+ #define DESCRIBE_DOC_NM_SETTING_CONNECTION_PERMISSIONS N_("An array of strings defining what access a given user has to this connection.  If this is NULL or empty, all users are allowed to access this connection; otherwise users are allowed if and only if they are in this list.  When this is not empty, the connection can be active only when one of the specified users is logged into an active session.  Each entry is of the form \"[type]:[id]:[reserved]\"; for example, \"user:dcbw:blah\". At this time only the \"user\" [type] is allowed.  Any other values are ignored and reserved for future use.  [id] is the username that this permission refers to, which may not contain the \":\" character. Any [reserved] information present must be ignored and is reserved for future use.  All of [type], [id], and [reserved] must be valid UTF-8.")
+@@ -215,8 +216,8 @@
+ #define DESCRIBE_DOC_NM_SETTING_IP4_CONFIG_DHCP_TIMEOUT N_("A timeout for a DHCP transaction in seconds.")
+ #define DESCRIBE_DOC_NM_SETTING_IP4_CONFIG_DNS N_("Array of IP addresses of DNS servers.")
+ #define DESCRIBE_DOC_NM_SETTING_IP4_CONFIG_DNS_OPTIONS N_("Array of DNS options as described in man 5 resolv.conf. NULL means that the options are unset and left at the default. In this case NetworkManager will use default options. This is distinct from an empty list of properties.")
+-#define DESCRIBE_DOC_NM_SETTING_IP4_CONFIG_DNS_PRIORITY N_("Intra-connection DNS priority. The relative priority to be used when determining the order of DNS servers in resolv.conf.  A lower value means that servers will be on top of the file.  Zero selects the default value, which is 50 for VPNs and 100 for other connections.  Note that the priority is to order DNS settings for multiple active connections. It does not disambiguate multiple DNS servers within the same connection profile. For that, just specify the DNS servers in the desired order. When multiple devices have configurations with the same priority, the one with an active default route will be preferred. Note that when using dns=dnsmasq the order is meaningless since dnsmasq forwards queries to all known servers at the same time. Negative values have the special effect of excluding other configurations with a greater priority value; so in presence of at least a negative priority, only DNS servers from connections with the lowest priority value will be used.")
+-#define DESCRIBE_DOC_NM_SETTING_IP4_CONFIG_DNS_SEARCH N_("Array of DNS search domains.")
++#define DESCRIBE_DOC_NM_SETTING_IP4_CONFIG_DNS_PRIORITY N_("DNS servers priority. The relative priority for DNS servers specified by this setting.  A lower value is better (higher priority).  Zero selects the default value, which is 50 for VPNs and 100 for other connections. Note that the priority is to order DNS settings for multiple active connections.  It does not disambiguate multiple DNS servers within the same connection profile. When using dns=default, servers with higher priority will be on top of resolv.conf.  To prioritize a given server over another one within the same connection, just specify them in the desired order.  When multiple devices have configurations with the same priority, the one with an active default route will be preferred.  Negative values have the special effect of excluding other configurations with a greater priority value; so in presence of at least a negative priority, only DNS servers from connections with the lowest priority value will be used. When using a DNS resolver that supports split-DNS as dns=dnsmasq or dns=systemd-resolved, each connection is used to query domains in its search list.  Queries for domains not present in any search list are routed through connections having the '~.' special wildcard domain, which is added automatically to connections with the default route (or can be added manually).  When multiple connections specify the same domain, the one with the highest priority (lowest numerical value) wins.  If a connection specifies a domain which is subdomain of another domain with a negative DNS priority value, the subdomain is ignored.")
++#define DESCRIBE_DOC_NM_SETTING_IP4_CONFIG_DNS_SEARCH N_("Array of DNS search domains. Domains starting with a tilde ('~') are considered 'routing' domains and are used only to decide the interface over which a query must be forwarded; they are not used to complete unqualified host names.")
+ #define DESCRIBE_DOC_NM_SETTING_IP4_CONFIG_GATEWAY N_("The gateway associated with this configuration. This is only meaningful if \"addresses\" is also set.")
+ #define DESCRIBE_DOC_NM_SETTING_IP4_CONFIG_IGNORE_AUTO_DNS N_("When \"method\" is set to \"auto\" and this property to TRUE, automatically configured nameservers and search domains are ignored and only nameservers and search domains specified in the \"dns\" and \"dns-search\" properties, if any, are used.")
+ #define DESCRIBE_DOC_NM_SETTING_IP4_CONFIG_IGNORE_AUTO_ROUTES N_("When \"method\" is set to \"auto\" and this property to TRUE, automatically configured routes are ignored and only routes specified in the \"routes\" property, if any, are used.")
+@@ -235,8 +236,8 @@
+ #define DESCRIBE_DOC_NM_SETTING_IP6_CONFIG_DHCP_TIMEOUT N_("A timeout for a DHCP transaction in seconds.")
+ #define DESCRIBE_DOC_NM_SETTING_IP6_CONFIG_DNS N_("Array of IP addresses of DNS servers.")
+ #define DESCRIBE_DOC_NM_SETTING_IP6_CONFIG_DNS_OPTIONS N_("Array of DNS options as described in man 5 resolv.conf. NULL means that the options are unset and left at the default. In this case NetworkManager will use default options. This is distinct from an empty list of properties.")
+-#define DESCRIBE_DOC_NM_SETTING_IP6_CONFIG_DNS_PRIORITY N_("Intra-connection DNS priority. The relative priority to be used when determining the order of DNS servers in resolv.conf.  A lower value means that servers will be on top of the file.  Zero selects the default value, which is 50 for VPNs and 100 for other connections.  Note that the priority is to order DNS settings for multiple active connections. It does not disambiguate multiple DNS servers within the same connection profile. For that, just specify the DNS servers in the desired order. When multiple devices have configurations with the same priority, the one with an active default route will be preferred. Note that when using dns=dnsmasq the order is meaningless since dnsmasq forwards queries to all known servers at the same time. Negative values have the special effect of excluding other configurations with a greater priority value; so in presence of at least a negative priority, only DNS servers from connections with the lowest priority value will be used.")
+-#define DESCRIBE_DOC_NM_SETTING_IP6_CONFIG_DNS_SEARCH N_("Array of DNS search domains.")
++#define DESCRIBE_DOC_NM_SETTING_IP6_CONFIG_DNS_PRIORITY N_("DNS servers priority. The relative priority for DNS servers specified by this setting.  A lower value is better (higher priority).  Zero selects the default value, which is 50 for VPNs and 100 for other connections. Note that the priority is to order DNS settings for multiple active connections.  It does not disambiguate multiple DNS servers within the same connection profile. When using dns=default, servers with higher priority will be on top of resolv.conf.  To prioritize a given server over another one within the same connection, just specify them in the desired order.  When multiple devices have configurations with the same priority, the one with an active default route will be preferred.  Negative values have the special effect of excluding other configurations with a greater priority value; so in presence of at least a negative priority, only DNS servers from connections with the lowest priority value will be used. When using a DNS resolver that supports split-DNS as dns=dnsmasq or dns=systemd-resolved, each connection is used to query domains in its search list.  Queries for domains not present in any search list are routed through connections having the '~.' special wildcard domain, which is added automatically to connections with the default route (or can be added manually).  When multiple connections specify the same domain, the one with the highest priority (lowest numerical value) wins.  If a connection specifies a domain which is subdomain of another domain with a negative DNS priority value, the subdomain is ignored.")
++#define DESCRIBE_DOC_NM_SETTING_IP6_CONFIG_DNS_SEARCH N_("Array of DNS search domains. Domains starting with a tilde ('~') are considered 'routing' domains and are used only to decide the interface over which a query must be forwarded; they are not used to complete unqualified host names.")
+ #define DESCRIBE_DOC_NM_SETTING_IP6_CONFIG_GATEWAY N_("The gateway associated with this configuration. This is only meaningful if \"addresses\" is also set.")
+ #define DESCRIBE_DOC_NM_SETTING_IP6_CONFIG_IGNORE_AUTO_DNS N_("When \"method\" is set to \"auto\" and this property to TRUE, automatically configured nameservers and search domains are ignored and only nameservers and search domains specified in the \"dns\" and \"dns-search\" properties, if any, are used.")
+ #define DESCRIBE_DOC_NM_SETTING_IP6_CONFIG_IGNORE_AUTO_ROUTES N_("When \"method\" is set to \"auto\" and this property to TRUE, automatically configured routes are ignored and only routes specified in the \"routes\" property, if any, are used.")
+--- network-manager-1.10.6.orig/libnm-core/nm-setting-connection.c
++++ network-manager-1.10.6/libnm-core/nm-setting-connection.c
+@@ -81,6 +81,7 @@ typedef struct {
+ 	NMMetered metered;
+ 	NMSettingConnectionLldp lldp;
+ 	gint auth_retries;
++	int mdns;
+ } NMSettingConnectionPrivate;
+ 
+ enum {
+@@ -103,6 +104,7 @@ enum {
+ 	PROP_GATEWAY_PING_TIMEOUT,
+ 	PROP_METERED,
+ 	PROP_LLDP,
++	PROP_MDNS,
+ 	PROP_STABLE_ID,
+ 	PROP_AUTH_RETRIES,
+ 
+@@ -862,6 +864,23 @@ nm_setting_connection_get_lldp (NMSettin
+ 	return NM_SETTING_CONNECTION_GET_PRIVATE (setting)->lldp;
+ }
+ 
++/**
++ * nm_setting_connection_get_mdns:
++ * @setting: the #NMSettingConnection
++ *
++ * Returns: the #NMSettingConnection:mdns property of the setting.
++ *
++ * Since: 1.10.14
++ **/
++NMSettingConnectionMdns
++nm_setting_connection_get_mdns (NMSettingConnection *setting)
++{
++	g_return_val_if_fail (NM_IS_SETTING_CONNECTION (setting),
++	                      NM_SETTING_CONNECTION_MDNS_DEFAULT);
++
++	return NM_SETTING_CONNECTION_GET_PRIVATE (setting)->mdns;
++}
++
+ static void
+ _set_error_missing_base_setting (GError **error, const char *type)
+ {
+@@ -1057,6 +1076,17 @@ verify (NMSetting *setting, NMConnection
+ 		return FALSE;
+ 	}
+ 
++	if (   priv->mdns < NM_SETTING_CONNECTION_MDNS_DEFAULT
++	    || priv->mdns > NM_SETTING_CONNECTION_MDNS_YES) {
++		g_set_error (error,
++		             NM_CONNECTION_ERROR,
++		             NM_CONNECTION_ERROR_INVALID_PROPERTY,
++		             _("mdns value %d is not valid"), priv->mdns);
++		g_prefix_error (error, "%s.%s: ", NM_SETTING_CONNECTION_SETTING_NAME,
++		                NM_SETTING_CONNECTION_MDNS);
++		return FALSE;
++	}
++
+ 	/* *** errors above here should be always fatal, below NORMALIZABLE_ERROR *** */
+ 
+ 	if (!priv->uuid) {
+@@ -1214,6 +1244,9 @@ compare_property (NMSetting *setting,
+ static void
+ nm_setting_connection_init (NMSettingConnection *setting)
+ {
++	NMSettingConnectionPrivate *priv = NM_SETTING_CONNECTION_GET_PRIVATE (setting);
++
++	priv->mdns = NM_SETTING_CONNECTION_MDNS_DEFAULT;
+ }
+ 
+ static void
+@@ -1332,6 +1365,9 @@ set_property (GObject *object, guint pro
+ 	case PROP_AUTH_RETRIES:
+ 		priv->auth_retries = g_value_get_int (value);
+ 		break;
++	case PROP_MDNS:
++		priv->mdns = g_value_get_int (value);
++		break;
+ 	default:
+ 		G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+ 		break;
+@@ -1420,6 +1456,9 @@ get_property (GObject *object, guint pro
+ 	case PROP_AUTH_RETRIES:
+ 		g_value_set_int (value, priv->auth_retries);
+ 		break;
++	case PROP_MDNS:
++		g_value_set_int (value, priv->mdns);
++		break;
+ 	default:
+ 		G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+ 		break;
+@@ -1982,4 +2021,37 @@ nm_setting_connection_class_init (NMSett
+ 		                   G_PARAM_CONSTRUCT |
+ 		                   NM_SETTING_PARAM_FUZZY_IGNORE |
+ 		                   G_PARAM_STATIC_STRINGS));
++
++	/**
++	 * NMSettingConnection:mdns:
++	 *
++	 * Whether mDNS is enabled for the connection.
++	 *
++	 * The permitted values are: yes: register hostname and resolving
++	 * for the connection, no: disable mDNS for the interface, resolve:
++	 * do not register hostname but allow resolving of mDNS host names.
++	 * When updating this property on a currently activated connection,
++	 * the change takes effect immediately.
++	 *
++	 * This feature requires a plugin which supports mDNS. One such
++	 * plugin is dns-systemd-resolved.
++	 *
++	 * Since: 1.10.14
++	 **/
++	/* ---ifcfg-rh---
++	 * property: mdns
++	 * variable: CONNECTION_MDNS(+)
++	 * values: yes,no,resolve
++	 * default: missing variable means global default
++	 * description: Whether or not mDNS is enabled for the connection
++	 * example: CONNECTION_MDNS=yes
++	 * ---end---
++	 */
++	g_object_class_install_property
++		(object_class, PROP_MDNS,
++		 g_param_spec_int (NM_SETTING_CONNECTION_MDNS, "", "",
++		                   G_MININT32, G_MAXINT32,
++		                   NM_SETTING_CONNECTION_MDNS_DEFAULT,
++		                   G_PARAM_READWRITE |
++		                   G_PARAM_STATIC_STRINGS));
+ }
+--- network-manager-1.10.6.orig/libnm-core/nm-setting-connection.h
++++ network-manager-1.10.6/libnm-core/nm-setting-connection.h
+@@ -64,6 +64,7 @@ G_BEGIN_DECLS
+ #define NM_SETTING_CONNECTION_METERED        "metered"
+ #define NM_SETTING_CONNECTION_LLDP           "lldp"
+ #define NM_SETTING_CONNECTION_AUTH_RETRIES   "auth-retries"
++#define NM_SETTING_CONNECTION_MDNS           "mdns"
+ 
+ /* Types for property values */
+ /**
+@@ -98,6 +99,24 @@ typedef enum {
+ } NMSettingConnectionLldp;
+ 
+ /**
++ * NMSettingConnectionMdns:
++ * @NM_SETTING_CONNECTION_MDNS_DEFAULT: default value
++ * @NM_SETTING_CONNECTION_MDNS_NO: disable mDNS
++ * @NM_SETTING_CONNECTION_MDNS_RESOLVE: support only resolving, do not register hostname
++ * @NM_SETTING_CONNECTION_MDNS_YES: enable mDNS
++ *
++ * #NMSettingConnectionMdns values indicate whether mDNS should be enabled.
++ *
++ * Since: 1.10.14
++ */
++typedef enum {
++	NM_SETTING_CONNECTION_MDNS_DEFAULT      = -1,
++	NM_SETTING_CONNECTION_MDNS_NO           = 0,
++	NM_SETTING_CONNECTION_MDNS_RESOLVE      = 1,
++	NM_SETTING_CONNECTION_MDNS_YES          = 2,
++} NMSettingConnectionMdns;
++
++/**
+  * NMSettingConnection:
+  *
+  * General Connection Profile Settings
+@@ -170,6 +189,8 @@ NMSettingConnectionLldp nm_setting_conne
+ NM_AVAILABLE_IN_1_10
+ gint        nm_setting_connection_get_auth_retries     (NMSettingConnection *setting);
+ 
++NM_AVAILABLE_IN_1_10_14
++NMSettingConnectionMdns   nm_setting_connection_get_mdns (NMSettingConnection *setting);
+ G_END_DECLS
+ 
+ #endif /* __NM_SETTING_CONNECTION_H__ */
+--- network-manager-1.10.6.orig/libnm-core/nm-setting-ip-config.c
++++ network-manager-1.10.6/libnm-core/nm-setting-ip-config.c
+@@ -2960,7 +2960,10 @@ nm_setting_ip_config_class_init (NMSetti
+ 	/**
+ 	 * NMSettingIPConfig:dns-search:
+ 	 *
+-	 * Array of DNS search domains.
++	 * Array of DNS search domains. Domains starting with a tilde ('~')
++	 * are considered 'routing' domains and are used only to decide the
++	 * interface over which a query must be forwarded; they are not used
++	 * to complete unqualified host names.
+ 	 **/
+ 	g_object_class_install_property
+ 		(object_class, PROP_DNS_SEARCH,
+@@ -2990,24 +2993,34 @@ nm_setting_ip_config_class_init (NMSetti
+ 	/**
+ 	 * NMSettingIPConfig:dns-priority:
+ 	 *
+-	 * Intra-connection DNS priority.
++	 * DNS servers priority.
+ 	 *
+-	 * The relative priority to be used when determining the order of DNS
+-	 * servers in resolv.conf.  A lower value means that servers will be on top
+-	 * of the file.  Zero selects the default value, which is 50 for VPNs and
+-	 * 100 for other connections.  Note that the priority is to order DNS
+-	 * settings for multiple active connections. It does not disambiguate
+-	 * multiple DNS servers within the same connection profile. For that,
+-	 * just specify the DNS servers in the desired order.
+-	 * When multiple devices have configurations with the same priority, the
+-	 * one with an active default route will be preferred.
+-	 * Note that when using dns=dnsmasq the order is meaningless
+-	 * since dnsmasq forwards queries to all known servers at the same time.
+-	 *
+-	 * Negative values have the special effect of excluding other configurations
+-	 * with a greater priority value; so in presence of at least a negative
+-	 * priority, only DNS servers from connections with the lowest priority
+-	 * value will be used.
++	 * The relative priority for DNS servers specified by this setting.  A lower
++	 * value is better (higher priority).  Zero selects the default value, which
++	 * is 50 for VPNs and 100 for other connections.
++	 *
++	 * Note that the priority is to order DNS settings for multiple active
++	 * connections.  It does not disambiguate multiple DNS servers within the
++	 * same connection profile.
++	 *
++	 * When using dns=default, servers with higher priority will be on top of
++	 * resolv.conf.  To prioritize a given server over another one within the
++	 * same connection, just specify them in the desired order.  When multiple
++	 * devices have configurations with the same priority, the one with an
++	 * active default route will be preferred.  Negative values have the special
++	 * effect of excluding other configurations with a greater priority value;
++	 * so in presence of at least a negative priority, only DNS servers from
++	 * connections with the lowest priority value will be used.
++	 *
++	 * When using a DNS resolver that supports split-DNS as dns=dnsmasq or
++	 * dns=systemd-resolved, each connection is used to query domains in its
++	 * search list.  Queries for domains not present in any search list are
++	 * routed through connections having the '~.' special wildcard domain, which
++	 * is added automatically to connections with the default route (or can be
++	 * added manually).  When multiple connections specify the same domain, the
++	 * one with the highest priority (lowest numerical value) wins.  If a
++	 * connection specifies a domain which is subdomain of another domain with a
++	 * negative DNS priority value, the subdomain is ignored.
+ 	 *
+ 	 * Since: 1.4
+ 	 **/
+--- network-manager-1.10.6.orig/libnm-core/nm-version.h
++++ network-manager-1.10.6/libnm-core/nm-version.h
+@@ -152,4 +152,11 @@
+ # define NM_AVAILABLE_IN_1_10_2
+ #endif
+ 
++#if NM_VERSION_MAX_ALLOWED < NM_VERSION_1_10_14
++# define NM_AVAILABLE_IN_1_10_14         G_UNAVAILABLE(1,10.14)
++#else
++# define NM_AVAILABLE_IN_1_10_14
++#endif
++
++
+ #endif  /* NM_VERSION_H */
+--- network-manager-1.10.6.orig/libnm-core/tests/test-general.c
++++ network-manager-1.10.6/libnm-core/tests/test-general.c
+@@ -2572,6 +2572,7 @@ test_connection_diff_a_only (void)
+ 			{ NM_SETTING_CONNECTION_METERED,              NM_SETTING_DIFF_RESULT_IN_A },
+ 			{ NM_SETTING_CONNECTION_LLDP,                 NM_SETTING_DIFF_RESULT_IN_A },
+ 			{ NM_SETTING_CONNECTION_AUTH_RETRIES,         NM_SETTING_DIFF_RESULT_IN_A },
++			{ NM_SETTING_CONNECTION_MDNS,                 NM_SETTING_DIFF_RESULT_IN_A },
+ 			{ NULL, NM_SETTING_DIFF_RESULT_UNKNOWN }
+ 		} },
+ 		{ NM_SETTING_WIRED_SETTING_NAME, {
+--- network-manager-1.10.6.orig/libnm/libnm.ver
++++ network-manager-1.10.6/libnm/libnm.ver
+@@ -1331,3 +1331,9 @@ global:
+ 	nm_utils_tc_tfilter_from_str;
+ 	nm_utils_tc_tfilter_to_str;
+ } libnm_1_10_0;
++
++libnm_1_10_14 {
++global:
++	nm_setting_connection_get_mdns;
++	nm_setting_connection_mdns_get_type;
++} libnm_1_10_2;
+--- network-manager-1.10.6.orig/man/NetworkManager.conf.xml
++++ network-manager-1.10.6/man/NetworkManager.conf.xml
+@@ -655,6 +655,9 @@ ipv6.ip6-privacy=0
+           <term><varname>connection.lldp</varname></term>
+         </varlistentry>
+         <varlistentry>
++          <term><varname>connection.mdns</varname></term>
++        </varlistentry>
++        <varlistentry>
+           <term><varname>connection.stable-id</varname></term>
+         </varlistentry>
+         <varlistentry>
+--- /dev/null
++++ network-manager-1.10.6/shared/nm-utils/nm-c-list.h
+@@ -0,0 +1,74 @@
++/* -*- Mode: C; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*- */
++/* NetworkManager -- Network link manager
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the
++ * Free Software Foundation, Inc., 51 Franklin Street, Fifth Floor,
++ * Boston, MA 02110-1301 USA.
++ *
++ * (C) Copyright 2014 Red Hat, Inc.
++ */
++
++#ifndef __NM_C_LIST_H__
++#define __NM_C_LIST_H__
++
++#include "c-list.h"
++
++/*****************************************************************************/
++
++typedef struct {
++	CList lst;
++	void *data;
++} NMCListElem;
++
++static inline NMCListElem *
++nm_c_list_elem_new_stale (void *data)
++{
++	NMCListElem *elem;
++
++	elem = g_slice_new (NMCListElem);
++	elem->data = data;
++	return elem;
++}
++
++static inline void *
++nm_c_list_elem_get (CList *lst)
++{
++	if (!lst)
++		return NULL;
++	return c_list_entry (lst, NMCListElem, lst)->data;
++}
++
++static inline void
++nm_c_list_elem_free (NMCListElem *elem)
++{
++	if (elem) {
++		c_list_unlink_stale (&elem->lst);
++		g_slice_free (NMCListElem, elem);
++	}
++}
++
++static inline void
++nm_c_list_elem_free_all (CList *head, GDestroyNotify free_fcn)
++{
++	NMCListElem *elem;
++
++	while ((elem = c_list_first_entry (head, NMCListElem, lst))) {
++		if (free_fcn)
++			free_fcn (elem->data);
++		c_list_unlink_stale (&elem->lst);
++		g_slice_free (NMCListElem, elem);
++	}
++}
++
++#endif /* __NM_C_LIST_H__ */
+--- network-manager-1.10.6.orig/shared/nm-utils/nm-macros-internal.h
++++ network-manager-1.10.6/shared/nm-utils/nm-macros-internal.h
+@@ -1020,6 +1020,25 @@ nm_cmp_uint32_p_with_data (gconstpointer
+ 	return 0;
+ }
+ 
++static inline int
++nm_cmp_int2ptr_p_with_data (gconstpointer p_a, gconstpointer p_b, gpointer user_data)
++{
++	/* p_a and p_b are two pointers to a pointer, where the pointer is
++	 * interpreted as a integer using GPOINTER_TO_INT().
++	 *
++	 * That is the case of a hash-table that uses GINT_TO_POINTER() to
++	 * convert integers as pointers, and the resulting keys-as-array
++	 * array. */
++	const int a = GPOINTER_TO_INT (*((gconstpointer *) p_a));
++	const int b = GPOINTER_TO_INT (*((gconstpointer *) p_b));
++
++	if (a < b)
++		return -1;
++	if (a > b)
++		return 1;
++	return 0;
++}
++
+ /*****************************************************************************/
+ 
+ /* Taken from systemd's UNIQ_T and UNIQ macros. */
+--- network-manager-1.10.6.orig/src/devices/nm-device.c
++++ network-manager-1.10.6/src/devices/nm-device.c
+@@ -1775,6 +1775,34 @@ out:
+ 	return nm_utils_ip_route_metric_normalize (addr_family, route_metric);
+ }
+ 
++static NMSettingConnectionMdns
++_get_mdns (NMDevice *self)
++{
++	NMConnection *connection;
++	NMSettingConnectionMdns mdns = NM_SETTING_CONNECTION_MDNS_DEFAULT;
++
++	g_return_val_if_fail (NM_IS_DEVICE (self), NM_SETTING_CONNECTION_MDNS_DEFAULT);
++
++	connection = nm_device_get_applied_connection (self);
++	if (connection)
++		mdns = nm_setting_connection_get_mdns (nm_connection_get_setting_connection (connection));
++
++	if (mdns == NM_SETTING_CONNECTION_MDNS_DEFAULT) {
++		gs_free char *value = NULL;
++
++		value = nm_config_data_get_connection_default (NM_CONFIG_GET_DATA,
++		                                               "connection.mdns",
++		                                               self);
++		mdns = _nm_utils_ascii_str_to_int64 (value,
++		                                     10,
++		                                     NM_SETTING_CONNECTION_MDNS_NO,
++		                                     NM_SETTING_CONNECTION_MDNS_YES,
++		                                     NM_SETTING_CONNECTION_MDNS_DEFAULT);
++	}
++
++	return mdns;
++}
++
+ guint32
+ nm_device_get_route_table (NMDevice *self,
+                            int addr_family,
+@@ -5837,6 +5865,7 @@ ensure_con_ip4_config (NMDevice *self)
+ 	priv->con_ip4_config = _ip4_config_new (self);
+ 	nm_ip4_config_merge_setting (priv->con_ip4_config,
+ 	                             nm_connection_get_setting_ip4_config (connection),
++	                             _get_mdns (self),
+ 	                             nm_device_get_route_table (self, AF_INET, TRUE),
+ 	                             nm_device_get_route_metric (self, AF_INET));
+ 
+@@ -6145,6 +6174,7 @@ dhcp4_state_changed (NMDhcpClient *clien
+ 			manual = _ip4_config_new (self);
+ 			nm_ip4_config_merge_setting (manual,
+ 			                             nm_connection_get_setting_ip4_config (connection),
++			                             NM_SETTING_CONNECTION_MDNS_DEFAULT,
+ 			                             nm_device_get_route_table (self, AF_INET, TRUE),
+ 			                             nm_device_get_route_metric (self, AF_INET));
+ 
+@@ -6524,6 +6554,7 @@ act_stage3_ip4_config_start (NMDevice *s
+ 		config = _ip4_config_new (self);
+ 		nm_ip4_config_merge_setting (config,
+ 		                             nm_connection_get_setting_ip4_config (connection),
++		                             NM_SETTING_CONNECTION_MDNS_DEFAULT,
+ 		                             nm_device_get_route_table (self, AF_INET, TRUE),
+ 		                             nm_device_get_route_metric (self, AF_INET));
+ 
+@@ -9252,6 +9283,7 @@ nm_device_reactivate_ip4_config (NMDevic
+ 		priv->con_ip4_config = _ip4_config_new (self);
+ 		nm_ip4_config_merge_setting (priv->con_ip4_config,
+ 		                             s_ip4_new,
++		                             _get_mdns (self),
+ 		                             nm_device_get_route_table (self, AF_INET, TRUE),
+ 		                             nm_device_get_route_metric (self, AF_INET));
+ 
+--- network-manager-1.10.6.orig/src/devices/nm-device.h
++++ network-manager-1.10.6/src/devices/nm-device.h
+@@ -24,6 +24,7 @@
+ 
+ #include <netinet/in.h>
+ 
++#include "nm-setting-connection.h"
+ #include "nm-exported-object.h"
+ #include "nm-dbus-interface.h"
+ #include "nm-connection.h"
+--- network-manager-1.10.6.orig/src/dns/nm-dns-dnsmasq.c
++++ network-manager-1.10.6/src/dns/nm-dns-dnsmasq.c
+@@ -75,66 +75,6 @@ G_DEFINE_TYPE (NMDnsDnsmasq, nm_dns_dnsm
+ 
+ /*****************************************************************************/
+ 
+-static char **
+-get_ip4_rdns_domains (NMIP4Config *ip4)
+-{
+-	char **strv;
+-	GPtrArray *domains = NULL;
+-	NMDedupMultiIter ipconf_iter;
+-	const NMPlatformIP4Address *address;
+-	const NMPlatformIP4Route *route;
+-
+-	g_return_val_if_fail (ip4 != NULL, NULL);
+-
+-	domains = g_ptr_array_sized_new (5);
+-
+-	nm_ip_config_iter_ip4_address_for_each (&ipconf_iter, ip4, &address)
+-		nm_utils_get_reverse_dns_domains_ip4 (address->address, address->plen, domains);
+-
+-	nm_ip_config_iter_ip4_route_for_each (&ipconf_iter, ip4, &route) {
+-		if (!NM_PLATFORM_IP_ROUTE_IS_DEFAULT (route))
+-			nm_utils_get_reverse_dns_domains_ip4 (route->network, route->plen, domains);
+-	}
+-
+-	/* Terminating NULL so we can use g_strfreev() to free it */
+-	g_ptr_array_add (domains, NULL);
+-
+-	/* Free the array and return NULL if the only element was the ending NULL */
+-	strv = (char **) g_ptr_array_free (domains, (domains->len == 1));
+-
+-	return _nm_utils_strv_cleanup (strv, FALSE, FALSE, TRUE);
+-}
+-
+-static char **
+-get_ip6_rdns_domains (NMIP6Config *ip6)
+-{
+-	char **strv;
+-	GPtrArray *domains = NULL;
+-	NMDedupMultiIter ipconf_iter;
+-	const NMPlatformIP6Address *address;
+-	const NMPlatformIP6Route *route;
+-
+-	g_return_val_if_fail (ip6 != NULL, NULL);
+-
+-	domains = g_ptr_array_sized_new (5);
+-
+-	nm_ip_config_iter_ip6_address_for_each (&ipconf_iter, ip6, &address)
+-		nm_utils_get_reverse_dns_domains_ip6 (&address->address, address->plen, domains);
+-
+-	nm_ip_config_iter_ip6_route_for_each (&ipconf_iter, ip6, &route) {
+-		if (!NM_PLATFORM_IP_ROUTE_IS_DEFAULT (route))
+-			nm_utils_get_reverse_dns_domains_ip6 (&route->network, route->plen, domains);
+-	}
+-
+-	/* Terminating NULL so we can use g_strfreev() to free it */
+-	g_ptr_array_add (domains, NULL);
+-
+-	/* Free the array and return NULL if the only element was the ending NULL */
+-	strv = (char **) g_ptr_array_free (domains, (domains->len == 1));
+-
+-	return _nm_utils_strv_cleanup (strv, FALSE, FALSE, TRUE);
+-}
+-
+ static void
+ add_dnsmasq_nameserver (NMDnsDnsmasq *self,
+                         GVariantBuilder *servers,
+@@ -155,96 +95,43 @@ add_dnsmasq_nameserver (NMDnsDnsmasq *se
+ 	g_variant_builder_close (servers);
+ }
+ 
+-static gboolean
+-add_ip4_config (NMDnsDnsmasq *self, GVariantBuilder *servers, NMIP4Config *ip4,
+-                const char *iface, gboolean split)
+-{
+-	char buf[INET_ADDRSTRLEN + 1 + IFNAMSIZ];
+-	char buf2[INET_ADDRSTRLEN];
+-	in_addr_t addr;
+-	int nnameservers, i_nameserver, n, i;
+-	gboolean added = FALSE;
+-
+-	g_return_val_if_fail (iface, FALSE);
+-	nnameservers = nm_ip4_config_get_num_nameservers (ip4);
+-
+-	if (split) {
+-		char **domains, **iter;
+-
+-		if (nnameservers == 0)
+-			return FALSE;
+-
+-		for (i_nameserver = 0; i_nameserver < nnameservers; i_nameserver++) {
+-			addr = nm_ip4_config_get_nameserver (ip4, i_nameserver);
+-			g_snprintf (buf, sizeof (buf), "%s@%s",
+-			            nm_utils_inet4_ntop (addr, buf2), iface);
+-
+-			/* searches are preferred over domains */
+-			n = nm_ip4_config_get_num_searches (ip4);
+-			for (i = 0; i < n; i++) {
+-				add_dnsmasq_nameserver (self,
+-				                        servers,
+-				                        buf,
+-				                        nm_ip4_config_get_search (ip4, i));
+-				added = TRUE;
+-			}
+-
+-			if (n == 0) {
+-				/* If not searches, use any domains */
+-				n = nm_ip4_config_get_num_domains (ip4);
+-				for (i = 0; i < n; i++) {
+-					add_dnsmasq_nameserver (self,
+-					                        servers,
+-					                        buf,
+-					                        nm_ip4_config_get_domain (ip4, i));
+-					added = TRUE;
+-				}
+-			}
+-
+-			/* Ensure reverse-DNS works by directing queries for in-addr.arpa
+-			 * domains to the split domain's nameserver.
+-			 */
+-			domains = get_ip4_rdns_domains (ip4);
+-			if (domains) {
+-				for (iter = domains; iter && *iter; iter++)
+-					add_dnsmasq_nameserver (self, servers, buf, *iter);
+-				g_strfreev (domains);
+-			}
+-		}
+-	}
++#define IP_ADDR_TO_STRING_BUFLEN (NM_UTILS_INET_ADDRSTRLEN + 1 + IFNAMSIZ)
+ 
+-	/* If no searches or domains, just add the nameservers */
+-	if (!added) {
+-		for (i = 0; i < nnameservers; i++) {
+-			addr = nm_ip4_config_get_nameserver (ip4, i);
+-			g_snprintf (buf, sizeof (buf), "%s@%s",
+-			            nm_utils_inet4_ntop (addr, buf2), iface);
+-			add_dnsmasq_nameserver (self, servers, buf, NULL);
+-		}
+-	}
+-
+-	return TRUE;
+-}
+-
+-static char *
+-ip6_addr_to_string (const struct in6_addr *addr, const char *iface)
++static const char *
++ip_addr_to_string (int addr_family, gconstpointer addr, const char *iface, char *out_buf)
+ {
+-	char buf[NM_UTILS_INET_ADDRSTRLEN];
+-
+-	if (IN6_IS_ADDR_V4MAPPED (addr))
+-		nm_utils_inet4_ntop (addr->s6_addr32[3], buf);
+-	else
+-		nm_utils_inet6_ntop (addr, buf);
+-
+-	/* Need to scope link-local addresses with %<zone-id>. Before dnsmasq 2.58,
+-	 * only '@' was supported as delimiter. Since 2.58, '@' and '%' are
+-	 * supported. Due to a bug, since 2.73 only '%' works properly as "server"
+-	 * address.
+-	 */
+-	return g_strdup_printf ("%s%c%s",
+-	                        buf,
+-	                        IN6_IS_ADDR_LINKLOCAL (addr) ? '%' : '@',
+-	                        iface);
++	int n_written;
++	char buf2[NM_UTILS_INET_ADDRSTRLEN];
++	const char *separator;
++
++	nm_assert_addr_family (addr_family);
++	nm_assert (addr);
++	nm_assert (out_buf);
++
++	if (addr_family == AF_INET) {
++		nm_utils_inet_ntop (addr_family, addr, buf2);
++		separator = "@";
++	} else {
++		if (IN6_IS_ADDR_V4MAPPED (addr))
++			nm_utils_inet4_ntop (((const struct in6_addr *) addr)->s6_addr32[3], buf2);
++		else
++			nm_utils_inet6_ntop (addr, buf2);
++		/* Need to scope link-local addresses with %<zone-id>. Before dnsmasq 2.58,
++		 * only '@' was supported as delimiter. Since 2.58, '@' and '%' are
++		 * supported. Due to a bug, since 2.73 only '%' works properly as "server"
++		 * address.
++		 */
++		separator = IN6_IS_ADDR_LINKLOCAL (addr) ? "%" : "@";
++	}
++
++	n_written = g_snprintf (out_buf,
++	                        IP_ADDR_TO_STRING_BUFLEN,
++	                        "%s%s%s",
++	                        buf2,
++	                        iface ? separator : "",
++	                        iface ?: "");
++	nm_assert (n_written < IP_ADDR_TO_STRING_BUFLEN);
++	return out_buf;
+ }
+ 
+ static void
+@@ -271,96 +158,39 @@ add_global_config (NMDnsDnsmasq *self, G
+ 	}
+ }
+ 
+-static gboolean
+-add_ip6_config (NMDnsDnsmasq *self, GVariantBuilder *servers, NMIP6Config *ip6,
+-                const char *iface, gboolean split)
++static void
++add_ip_config (NMDnsDnsmasq *self, GVariantBuilder *servers, const NMDnsIPConfigData *ip_data)
+ {
+-	const struct in6_addr *addr;
+-	char *buf = NULL;
+-	int nnameservers, i_nameserver, n, i;
+-	gboolean added = FALSE;
+-
+-	g_return_val_if_fail (iface, FALSE);
+-	nnameservers = nm_ip6_config_get_num_nameservers (ip6);
+-
+-	if (split) {
+-		char **domains, **iter;
+-
+-		if (nnameservers == 0)
+-			return FALSE;
+-
+-		for (i_nameserver = 0; i_nameserver < nnameservers; i_nameserver++) {
+-			addr = nm_ip6_config_get_nameserver (ip6, i_nameserver);
+-			buf = ip6_addr_to_string (addr, iface);
+-
+-			/* searches are preferred over domains */
+-			n = nm_ip6_config_get_num_searches (ip6);
+-			for (i = 0; i < n; i++) {
+-				add_dnsmasq_nameserver (self,
+-				                        servers,
+-				                        buf,
+-				                        nm_ip6_config_get_search (ip6, i));
+-				added = TRUE;
+-			}
+-
+-			if (n == 0) {
+-				/* If not searches, use any domains */
+-				n = nm_ip6_config_get_num_domains (ip6);
+-				for (i = 0; i < n; i++) {
+-					add_dnsmasq_nameserver (self,
+-					                        servers,
+-					                        buf,
+-					                        nm_ip6_config_get_domain (ip6, i));
+-					added = TRUE;
+-				}
+-			}
+-
+-			/* Ensure reverse-DNS works by directing queries for ip6.arpa
+-			 * domains to the split domain's nameserver.
+-			 */
+-			domains = get_ip6_rdns_domains (ip6);
+-			if (domains) {
+-				for (iter = domains; iter && *iter; iter++)
+-					add_dnsmasq_nameserver (self, servers, buf, *iter);
+-				g_strfreev (domains);
+-			}
+-
+-			g_free (buf);
++	NMIPConfig *ip_config = ip_data->ip_config;
++	gconstpointer addr;
++	const char *iface, *domain;
++	char ip_addr_to_string_buf[IP_ADDR_TO_STRING_BUFLEN];
++	int addr_family;
++	guint i, j, num;
++
++	iface = nm_platform_link_get_name (NM_PLATFORM_GET, ip_data->data->ifindex);
++	addr_family = nm_ip_config_get_addr_family (ip_config);
++
++	num = nm_ip_config_get_num_nameservers (ip_config);
++	for (i = 0; i < num; i++) {
++		addr = nm_ip_config_get_nameserver (ip_config, i);
++		ip_addr_to_string (addr_family, addr, iface, ip_addr_to_string_buf);
++		for (j = 0; ip_data->domains.search[j]; j++) {
++			domain = nm_utils_parse_dns_domain (ip_data->domains.search[j], NULL);
++			add_dnsmasq_nameserver (self,
++			                        servers,
++			                        ip_addr_to_string_buf,
++			                        domain[0] ? domain : NULL);
+ 		}
+-	}
+ 
+-	/* If no searches or domains, just add the nameservers */
+-	if (!added) {
+-		for (i = 0; i < nnameservers; i++) {
+-			addr = nm_ip6_config_get_nameserver (ip6, i);
+-			buf = ip6_addr_to_string (addr, iface);
+-			if (buf) {
+-				add_dnsmasq_nameserver (self, servers, buf, NULL);
+-				g_free (buf);
++		if (ip_data->domains.reverse) {
++			for (j = 0; ip_data->domains.reverse[j]; j++) {
++				add_dnsmasq_nameserver (self, servers,
++				                        ip_addr_to_string_buf,
++				                        ip_data->domains.reverse[j]);
+ 			}
+ 		}
+ 	}
+-
+-	return TRUE;
+-}
+-
+-static gboolean
+-add_ip_config_data (NMDnsDnsmasq *self, GVariantBuilder *servers, const NMDnsIPConfigData *data)
+-{
+-	if (NM_IS_IP4_CONFIG (data->config)) {
+-		return add_ip4_config (self,
+-		                       servers,
+-		                       (NMIP4Config *) data->config,
+-		                       data->iface,
+-		                       data->type == NM_DNS_IP_CONFIG_TYPE_VPN);
+-	} else if (NM_IS_IP6_CONFIG (data->config)) {
+-		return add_ip6_config (self,
+-		                       servers,
+-		                       (NMIP6Config *) data->config,
+-		                       data->iface,
+-		                       data->type == NM_DNS_IP_CONFIG_TYPE_VPN);
+-	} else
+-		g_return_val_if_reached (FALSE);
+ }
+ 
+ static void
+@@ -550,15 +380,14 @@ start_dnsmasq (NMDnsDnsmasq *self)
+ 
+ static gboolean
+ update (NMDnsPlugin *plugin,
+-        const GPtrArray *configs,
+         const NMGlobalDnsConfig *global_config,
++        const CList *ip_config_lst_head,
+         const char *hostname)
+ {
+ 	NMDnsDnsmasq *self = NM_DNS_DNSMASQ (plugin);
+ 	NMDnsDnsmasqPrivate *priv = NM_DNS_DNSMASQ_GET_PRIVATE (self);
+ 	GVariantBuilder servers;
+-	guint i;
+-	int prio, first_prio;
++	const NMDnsIPConfigData *ip_data;
+ 
+ 	start_dnsmasq (self);
+ 
+@@ -567,16 +396,8 @@ update (NMDnsPlugin *plugin,
+ 	if (global_config)
+ 		add_global_config (self, &servers, global_config);
+ 	else {
+-		for (i = 0; i < configs->len; i++) {
+-			const NMDnsIPConfigData *data = configs->pdata[i];
+-
+-			prio = nm_ip_config_get_dns_priority (data->config);
+-			if (i == 0)
+-				first_prio = prio;
+-			else if (first_prio < 0 && first_prio != prio)
+-				break;
+-			add_ip_config_data (self, &servers, data);
+-		}
++		c_list_for_each_entry (ip_data, ip_config_lst_head, ip_config_lst)
++			add_ip_config (self, &servers, ip_data);
+ 	}
+ 
+ 	g_clear_pointer (&priv->set_server_ex_args, g_variant_unref);
+--- network-manager-1.10.6.orig/src/dns/nm-dns-manager.c
++++ network-manager-1.10.6/src/dns/nm-dns-manager.c
+@@ -70,6 +70,24 @@
+ #define PLUGIN_RATELIMIT_BURST       5
+ #define PLUGIN_RATELIMIT_DELAY       300
+ 
++/*****************************************************************************/
++
++typedef enum {
++	SR_SUCCESS,
++	SR_NOTFOUND,
++	SR_ERROR
++} SpawnResult;
++
++typedef struct {
++	GPtrArray *nameservers;
++	GPtrArray *searches;
++	GPtrArray *options;
++	const char *nis_domain;
++	GPtrArray *nis_servers;
++} NMResolvConfData;
++
++/*****************************************************************************/
++
+ enum {
+ 	CONFIG_CHANGED,
+ 
+@@ -84,44 +102,16 @@ NM_GOBJECT_PROPERTIES_DEFINE (NMDnsManag
+ 
+ static guint signals[LAST_SIGNAL] = { 0 };
+ 
+-typedef enum {
+-	SR_SUCCESS,
+-	SR_NOTFOUND,
+-	SR_ERROR
+-} SpawnResult;
+-
+-NM_DEFINE_SINGLETON_GETTER (NMDnsManager, nm_dns_manager_get, NM_TYPE_DNS_MANAGER);
+-
+-/*****************************************************************************/
+-
+-#define _NMLOG_PREFIX_NAME                "dns-mgr"
+-#define _NMLOG_DOMAIN                     LOGD_DNS
+-#define _NMLOG(level, ...) \
+-    G_STMT_START { \
+-        const NMLogLevel __level = (level); \
+-        \
+-        if (nm_logging_enabled (__level, _NMLOG_DOMAIN)) { \
+-            char __prefix[20]; \
+-            const NMDnsManager *const __self = (self); \
+-            \
+-            _nm_log (__level, _NMLOG_DOMAIN, 0, NULL, NULL, \
+-                     "%s%s: " _NM_UTILS_MACRO_FIRST (__VA_ARGS__), \
+-                     _NMLOG_PREFIX_NAME, \
+-                     ((!__self || __self == singleton_instance) \
+-                        ? "" \
+-                        : nm_sprintf_buf (__prefix, "[%p]", __self)) \
+-                     _NM_UTILS_MACRO_REST (__VA_ARGS__)); \
+-        } \
+-    } G_STMT_END
+-
+-/*****************************************************************************/
+-
+ typedef struct {
+-	GPtrArray *configs;
++	GHashTable *configs;
++	CList ip_config_lst_head;
+ 	GVariant *config_variant;
+-	NMDnsIPConfigData *best_conf4, *best_conf6;
+ 
+-	bool need_sort:1;
++	NMDnsIPConfigData *best_ip_config_4;
++	NMDnsIPConfigData *best_ip_config_6;
++
++	bool ip_config_lst_need_sort:1;
++
+ 	bool dns_touched:1;
+ 	bool is_stopped:1;
+ 
+@@ -157,8 +147,40 @@ G_DEFINE_TYPE (NMDnsManager, nm_dns_mana
+ 
+ #define NM_DNS_MANAGER_GET_PRIVATE(self) _NM_GET_PRIVATE(self, NMDnsManager, NM_IS_DNS_MANAGER)
+ 
++NM_DEFINE_SINGLETON_GETTER (NMDnsManager, nm_dns_manager_get, NM_TYPE_DNS_MANAGER);
++
++/*****************************************************************************/
++
++#define _NMLOG_PREFIX_NAME                "dns-mgr"
++#define _NMLOG_DOMAIN                     LOGD_DNS
++#define _NMLOG(level, ...) \
++    G_STMT_START { \
++        const NMLogLevel __level = (level); \
++        \
++        if (nm_logging_enabled (__level, _NMLOG_DOMAIN)) { \
++            char __prefix[20]; \
++            const NMDnsManager *const __self = (self); \
++            \
++            _nm_log (__level, _NMLOG_DOMAIN, 0, NULL, NULL, \
++                     "%s%s: " _NM_UTILS_MACRO_FIRST (__VA_ARGS__), \
++                     _NMLOG_PREFIX_NAME, \
++                     ((!__self || __self == singleton_instance) \
++                        ? "" \
++                        : nm_sprintf_buf (__prefix, "[%p]", __self)) \
++                     _NM_UTILS_MACRO_REST (__VA_ARGS__)); \
++        } \
++    } G_STMT_END
++
++/*****************************************************************************/
++
++static void _ip_config_dns_priority_changed (gpointer config,
++                                             GParamSpec *pspec,
++                                             NMDnsIPConfigData *ip_data);
++
++/*****************************************************************************/
++
+ static gboolean
+-domain_is_valid (const gchar *domain, gboolean check_public_suffix)
++domain_is_valid (const char *domain, gboolean check_public_suffix)
+ {
+ 	if (*domain == '\0')
+ 		return FALSE;
+@@ -169,15 +191,13 @@ domain_is_valid (const gchar *domain, gb
+ 	return TRUE;
+ }
+ 
+-/*****************************************************************************/
++static gboolean
++domain_is_routing (const char *domain)
++{
++	return domain[0] == '~';
++}
+ 
+-typedef struct {
+-	GPtrArray *nameservers;
+-	GPtrArray *searches;
+-	GPtrArray *options;
+-	const char *nis_domain;
+-	GPtrArray *nis_servers;
+-} NMResolvConfData;
++/*****************************************************************************/
+ 
+ NM_UTILS_LOOKUP_STR_DEFINE_STATIC (_rc_manager_to_string, NMDnsManagerResolvConfManager,
+ 	NM_UTILS_LOOKUP_DEFAULT_WARN (NULL),
+@@ -192,44 +212,112 @@ NM_UTILS_LOOKUP_STR_DEFINE_STATIC (_rc_m
+ 
+ NM_UTILS_LOOKUP_STR_DEFINE_STATIC (_config_type_to_string, NMDnsIPConfigType,
+ 	NM_UTILS_LOOKUP_DEFAULT_WARN ("<unknown>"),
++	NM_UTILS_LOOKUP_STR_ITEM (NM_DNS_IP_CONFIG_TYPE_REMOVED, "removed"),
+ 	NM_UTILS_LOOKUP_STR_ITEM (NM_DNS_IP_CONFIG_TYPE_DEFAULT, "default"),
+ 	NM_UTILS_LOOKUP_STR_ITEM (NM_DNS_IP_CONFIG_TYPE_BEST_DEVICE, "best"),
+ 	NM_UTILS_LOOKUP_STR_ITEM (NM_DNS_IP_CONFIG_TYPE_VPN, "vpn"),
+ );
+ 
+-static NMDnsIPConfigData *
+-ip_config_data_new (gpointer config, NMDnsIPConfigType type, const char *iface)
++/*****************************************************************************/
++
++static void
++_ASSERT_config_data (const NMDnsConfigData *data)
++{
++	nm_assert (data);
++	nm_assert (NM_IS_DNS_MANAGER (data->self));
++	nm_assert (data->ifindex > 0);
++}
++
++static void
++_ASSERT_ip_config_data (const NMDnsIPConfigData *ip_data)
+ {
+-	NMDnsIPConfigData *data;
++	nm_assert (ip_data);
++	_ASSERT_config_data (ip_data->data);
++	nm_assert (NM_IS_IP_CONFIG (ip_data->ip_config));
++	nm_assert (c_list_contains (&ip_data->data->data_lst_head, &ip_data->data_lst));
++	nm_assert (ip_data->data->ifindex == nm_ip_config_get_ifindex (ip_data->ip_config));
++}
+ 
+-	data = g_slice_new0 (NMDnsIPConfigData);
+-	data->config = g_object_ref (config);
+-	data->iface = g_strdup (iface);
+-	data->type = type;
++static NMDnsIPConfigData *
++_ip_config_data_new (NMDnsConfigData *data,
++                     NMIPConfig *ip_config,
++                     NMDnsIPConfigType ip_config_type)
++{
++	NMDnsIPConfigData *ip_data;
++
++	_ASSERT_config_data (data);
++	nm_assert (NM_IS_IP_CONFIG (ip_config));
++	nm_assert (ip_config_type != NM_DNS_IP_CONFIG_TYPE_REMOVED);
++
++	ip_data = g_slice_new0 (NMDnsIPConfigData);
++	ip_data->data = data;
++	ip_data->ip_config = g_object_ref (ip_config);
++	ip_data->ip_config_type = ip_config_type;
++	c_list_link_tail (&data->data_lst_head, &ip_data->data_lst);
++	c_list_link_tail (&NM_DNS_MANAGER_GET_PRIVATE (data->self)->ip_config_lst_head, &ip_data->ip_config_lst);
++
++	g_signal_connect (ip_config,
++	                  NM_IS_IP4_CONFIG (ip_config)
++	                    ? "notify::" NM_IP4_CONFIG_DNS_PRIORITY
++	                    : "notify::" NM_IP6_CONFIG_DNS_PRIORITY,
++	                  (GCallback) _ip_config_dns_priority_changed, ip_data);
+ 
+-	return data;
++	_ASSERT_ip_config_data (ip_data);
++	return ip_data;
+ }
+ 
+ static void
+-ip_config_data_destroy (gpointer ptr)
++_ip_config_data_free (NMDnsIPConfigData *ip_data)
+ {
+-	NMDnsIPConfigData *data = ptr;
++	_ASSERT_ip_config_data (ip_data);
+ 
+-	if (!data)
+-		return;
++	c_list_unlink_stale (&ip_data->data_lst);
++	c_list_unlink_stale (&ip_data->ip_config_lst);
++
++	g_free (ip_data->domains.search);
++	g_strfreev (ip_data->domains.reverse);
++
++	g_signal_handlers_disconnect_by_func (ip_data->ip_config,
++	                                      _ip_config_dns_priority_changed,
++	                                      ip_data);
++
++	g_object_unref (ip_data->ip_config);
++	g_slice_free (NMDnsIPConfigData, ip_data);
++}
++
++static NMDnsIPConfigData *
++_config_data_find_ip_config (NMDnsConfigData *data,
++                             NMIPConfig *ip_config)
++{
++	NMDnsIPConfigData *ip_data;
++
++	_ASSERT_config_data (data);
++
++	c_list_for_each_entry (ip_data, &data->data_lst_head, data_lst) {
++		_ASSERT_ip_config_data (ip_data);
++
++		if (ip_data->ip_config == ip_config)
++			return ip_data;
++	}
++	return NULL;
++}
+ 
+-	g_object_unref (data->config);
+-	g_free (data->iface);
+-	g_slice_free (NMDnsIPConfigData, data);
++static void
++_config_data_free (NMDnsConfigData *data)
++{
++	_ASSERT_config_data (data);
++
++	nm_assert (c_list_is_empty (&data->data_lst_head));
++	g_slice_free (NMDnsConfigData, data);
+ }
+ 
+ static gint
+-ip_config_data_compare (const NMDnsIPConfigData *a, const NMDnsIPConfigData *b)
++_ip_config_data_cmp (const NMDnsIPConfigData *a, const NMDnsIPConfigData *b)
+ {
+ 	int a_prio, b_prio;
+ 
+-	a_prio = nm_ip_config_get_dns_priority (a->config);
+-	b_prio = nm_ip_config_get_dns_priority (b->config);
++	a_prio = nm_ip_config_get_dns_priority (a->ip_config);
++	b_prio = nm_ip_config_get_dns_priority (b->ip_config);
+ 
+ 	/* Configurations with lower priority value first */
+ 	if (a_prio < b_prio)
+@@ -238,24 +326,40 @@ ip_config_data_compare (const NMDnsIPCon
+ 		return 1;
+ 
+ 	/* Sort also according to type */
+-	if (a->type > b->type)
++	if (a->ip_config_type > b->ip_config_type)
+ 		return -1;
+-	else if (a->type < b->type)
++	else if (a->ip_config_type < b->ip_config_type)
+ 		return 1;
+ 
+ 	return 0;
+ }
+ 
+ static gint
+-ip_config_data_ptr_compare (gconstpointer a, gconstpointer b)
++_ip_config_lst_cmp (const CList *a,
++                    const CList *b,
++                    const void *user_data)
+ {
+-	const NMDnsIPConfigData *const *ptr_a = a, *const *ptr_b = b;
++	return _ip_config_data_cmp (c_list_entry (a, NMDnsIPConfigData, ip_config_lst),
++	                            c_list_entry (b, NMDnsIPConfigData, ip_config_lst));
++}
++
++static CList *
++_ip_config_lst_head (NMDnsManager *self)
++{
++	NMDnsManagerPrivate *priv = NM_DNS_MANAGER_GET_PRIVATE (self);
++
++	if (priv->ip_config_lst_need_sort) {
++		priv->ip_config_lst_need_sort = FALSE;
++		c_list_sort (&priv->ip_config_lst_head, _ip_config_lst_cmp, NULL);
++	}
+ 
+-	return ip_config_data_compare (*ptr_a, *ptr_b);
++	return &priv->ip_config_lst_head;
+ }
+ 
++/*****************************************************************************/
++
+ static void
+-add_string_item (GPtrArray *array, const char *str)
++add_string_item (GPtrArray *array, const char *str, gboolean dup)
+ {
+ 	int i;
+ 
+@@ -271,7 +375,7 @@ add_string_item (GPtrArray *array, const
+ 	}
+ 
+ 	/* No dupes, add the new item */
+-	g_ptr_array_add (array, g_strdup (str));
++	g_ptr_array_add (array, dup ? g_strdup (str): (gpointer) str);
+ }
+ 
+ static void
+@@ -282,24 +386,56 @@ add_dns_option_item (GPtrArray *array, c
+ }
+ 
+ static void
++add_dns_domains (GPtrArray *array, const NMIPConfig *ip_config,
++                 gboolean include_routing, gboolean dup)
++{
++	guint num_domains, num_searches, i;
++	const char *str;
++
++	num_domains = nm_ip_config_get_num_domains (ip_config);
++	num_searches = nm_ip_config_get_num_searches (ip_config);
++
++	for (i = 0; i < num_searches; i++) {
++		str = nm_ip_config_get_search (ip_config, i);
++		if (!include_routing && domain_is_routing (str))
++			continue;
++		if (!domain_is_valid (nm_utils_parse_dns_domain (str, NULL), FALSE))
++			continue;
++		add_string_item (array, str, dup);
++	}
++	if (num_domains > 1 || !num_searches) {
++		for (i = 0; i < num_domains; i++) {
++			str = nm_ip_config_get_domain (ip_config, i);
++			if (!include_routing && domain_is_routing (str))
++				continue;
++			if (!domain_is_valid (nm_utils_parse_dns_domain (str, NULL), FALSE))
++				continue;
++			add_string_item (array, str, dup);
++		}
++	}
++}
++
++static void
+ merge_one_ip_config (NMResolvConfData *rc,
+-                     const NMIPConfig *config,
+-                     const char *iface)
++                     int ifindex,
++                     const NMIPConfig *ip_config)
+ {
+ 	int addr_family;
+-	guint num, num_domains, num_searches, i;
++	guint num, i;
+ 	char buf[NM_UTILS_INET_ADDRSTRLEN + 50];
+ 	const char *str;
+ 
+-	addr_family = nm_ip_config_get_addr_family (config);
++	addr_family = nm_ip_config_get_addr_family (ip_config);
+ 
+ 	nm_assert_addr_family (addr_family);
++	nm_assert (ifindex > 0);
++	nm_assert (ifindex == nm_ip_config_get_ifindex (ip_config));
+ 
+-	num = nm_ip_config_get_num_nameservers (config);
++	num = nm_ip_config_get_num_nameservers (ip_config);
+ 	for (i = 0; i < num; i++) {
+ 		const NMIPAddr *addr;
+ 
+-		addr = nm_ip_config_get_nameserver (config, i);
++		addr = nm_ip_config_get_nameserver (ip_config, i);
+ 		if (addr_family == AF_INET)
+ 			nm_utils_inet_ntop (addr_family, addr, buf);
+ 		else if (IN6_IS_ADDR_V4MAPPED (addr))
+@@ -307,49 +443,42 @@ merge_one_ip_config (NMResolvConfData *r
+ 		else {
+ 			nm_utils_inet6_ntop (&addr->addr6, buf);
+ 			if (IN6_IS_ADDR_LINKLOCAL (addr)) {
+-				g_strlcat (buf, "%", sizeof (buf));
+-				g_strlcat (buf, iface, sizeof (buf));
++				const char *ifname;
++
++				ifname = nm_platform_link_get_name (NM_PLATFORM_GET, ifindex);
++				if (ifname) {
++					g_strlcat (buf, "%", sizeof (buf));
++					g_strlcat (buf, ifname, sizeof (buf));
++				}
+ 			}
+ 		}
+ 
+-		add_string_item (rc->nameservers, buf);
++		add_string_item (rc->nameservers, buf, TRUE);
+ 	}
+ 
+-	num_domains = nm_ip_config_get_num_domains (config);
+-	num_searches = nm_ip_config_get_num_searches (config);
+-	for (i = 0; i < num_searches; i++) {
+-		str = nm_ip_config_get_search (config, i);
+-		if (domain_is_valid (str, FALSE))
+-			add_string_item (rc->searches, str);
+-	}
+-	if (num_domains > 1 || !num_searches) {
+-		for (i = 0; i < num_domains; i++) {
+-			str = nm_ip_config_get_domain (config, i);
+-			if (domain_is_valid (str, FALSE))
+-				add_string_item (rc->searches, str);
+-		}
+-	}
++	add_dns_domains (rc->searches, ip_config, FALSE, TRUE);
+ 
+-	num = nm_ip_config_get_num_dns_options (config);
++	num = nm_ip_config_get_num_dns_options (ip_config);
+ 	for (i = 0; i < num; i++) {
+ 		add_dns_option_item (rc->options,
+-		                     nm_ip_config_get_dns_option (config, i));
++		                     nm_ip_config_get_dns_option (ip_config, i));
+ 	}
+ 
+ 	if (addr_family == AF_INET) {
+-		const NMIP4Config *config4 = (const NMIP4Config *) config;
++		const NMIP4Config *ip4_config = (const NMIP4Config *) ip_config;
+ 
+ 		/* NIS stuff */
+-		num = nm_ip4_config_get_num_nis_servers (config4);
++		num = nm_ip4_config_get_num_nis_servers (ip4_config);
+ 		for (i = 0; i < num; i++) {
+ 			add_string_item (rc->nis_servers,
+-			                 nm_utils_inet4_ntop (nm_ip4_config_get_nis_server (config4, i), buf));
++			                 nm_utils_inet4_ntop (nm_ip4_config_get_nis_server (ip4_config, i), buf),
++			                 TRUE);
+ 		}
+ 
+-		if (nm_ip4_config_get_nis_domain (config4)) {
++		if (nm_ip4_config_get_nis_domain (ip4_config)) {
+ 			/* FIXME: handle multiple domains */
+ 			if (!rc->nis_domain)
+-				rc->nis_domain = nm_ip4_config_get_nis_domain (config4);
++				rc->nis_domain = nm_ip4_config_get_nis_domain (ip4_config);
+ 		}
+ 	}
+ }
+@@ -817,25 +946,21 @@ update_resolv_conf (NMDnsManager *self,
+ static void
+ compute_hash (NMDnsManager *self, const NMGlobalDnsConfig *global, guint8 buffer[HASH_LEN])
+ {
+-	NMDnsManagerPrivate *priv = NM_DNS_MANAGER_GET_PRIVATE (self);
+ 	GChecksum *sum;
+ 	gsize len = HASH_LEN;
+-	guint i;
++	NMDnsIPConfigData *ip_data;
+ 
+ 	sum = g_checksum_new (G_CHECKSUM_SHA1);
+-	g_assert (len == g_checksum_type_get_length (G_CHECKSUM_SHA1));
++	nm_assert (len == g_checksum_type_get_length (G_CHECKSUM_SHA1));
+ 
+ 	if (global)
+ 		nm_global_dns_config_update_checksum (global, sum);
+ 	else {
+-		for (i = 0; i < priv->configs->len; i++) {
+-			NMDnsIPConfigData *data = priv->configs->pdata[i];
++		const CList *head;
+ 
+-			if (NM_IS_IP4_CONFIG (data->config))
+-				nm_ip4_config_hash ((NMIP4Config *) data->config, sum, TRUE);
+-			else if (NM_IS_IP6_CONFIG (data->config))
+-				nm_ip6_config_hash ((NMIP6Config *) data->config, sum, TRUE);
+-		}
++		head = _ip_config_lst_head (self);
++		c_list_for_each_entry (ip_data, head, ip_config_lst)
++			nm_ip_config_hash (ip_data->ip_config, sum, TRUE);
+ 	}
+ 
+ 	g_checksum_get_digest (sum, buffer, &len);
+@@ -858,18 +983,21 @@ merge_global_dns_config (NMResolvConfDat
+ 	options = nm_global_dns_config_get_options (global_conf);
+ 
+ 	for (i = 0; searches && searches[i]; i++) {
+-		if (domain_is_valid (searches[i], FALSE))
+-			add_string_item (rc->searches, searches[i]);
++		if (domain_is_routing (searches[i]))
++			continue;
++		if (!domain_is_valid (searches[i], FALSE))
++			continue;
++		add_string_item (rc->searches, searches[i], TRUE);
+ 	}
+ 
+ 	for (i = 0; options && options[i]; i++)
+-		add_string_item (rc->options, options[i]);
++		add_string_item (rc->options, options[i], TRUE);
+ 
+ 	default_domain = nm_global_dns_config_lookup_domain (global_conf, "*");
+ 	g_assert (default_domain);
+ 	servers = nm_global_dns_domain_get_servers (default_domain);
+ 	for (i = 0; servers && servers[i]; i++)
+-		add_string_item (rc->nameservers, servers[i]);
++		add_string_item (rc->nameservers, servers[i], TRUE);
+ 
+ 	return TRUE;
+ }
+@@ -909,17 +1037,16 @@ _ptrarray_to_strv (GPtrArray *parray)
+ }
+ 
+ static void
+-_collect_resolv_conf_data (NMDnsManager *self, /* only for logging context, no other side-effects */
++_collect_resolv_conf_data (NMDnsManager *self,
+                            NMGlobalDnsConfig *global_config,
+-                           const GPtrArray *configs,
+-                           const char *hostname,
+                            char ***out_searches,
+                            char ***out_options,
+                            char ***out_nameservers,
+                            char ***out_nis_servers,
+                            const char **out_nis_domain)
+ {
+-	guint i, j, num, len;
++	NMDnsManagerPrivate *priv;
++	guint i, num, len;
+ 	NMResolvConfData rc = {
+ 		.nameservers = g_ptr_array_new (),
+ 		.searches = g_ptr_array_new (),
+@@ -928,37 +1055,44 @@ _collect_resolv_conf_data (NMDnsManager
+ 		.nis_servers = g_ptr_array_new (),
+ 	};
+ 
++	priv = NM_DNS_MANAGER_GET_PRIVATE (self);
++
+ 	if (global_config)
+ 		merge_global_dns_config (&rc, global_config);
+ 	else {
+ 		nm_auto_free_gstring GString *tmp_gstring = NULL;
+ 		int prio, first_prio = 0;
+-		NMDnsIPConfigData *current;
++		const NMDnsIPConfigData *ip_data;
++		const CList *head;
++		gboolean is_first = TRUE;
+ 
+-		for (i = 0, j = 0; i < configs->len; i++) {
++		head = _ip_config_lst_head (self);
++		c_list_for_each_entry (ip_data, head, ip_config_lst) {
+ 			gboolean skip = FALSE;
+ 
+-			current = configs->pdata[i];
++			_ASSERT_ip_config_data (ip_data);
+ 
+-			prio = nm_ip_config_get_dns_priority (current->config);
++			prio = nm_ip_config_get_dns_priority (ip_data->ip_config);
+ 
+-			if (i == 0)
++			if (is_first) {
++				is_first = FALSE;
+ 				first_prio = prio;
+-			else if (first_prio < 0 && first_prio != prio)
++			} else if (   first_prio < 0
++			           && first_prio != prio)
+ 				skip = TRUE;
+ 
+-			if (nm_ip_config_get_num_nameservers (current->config)) {
+-				_LOGT ("config: %8d %-7s v%c %-16s %s: %s",
++			if (nm_ip_config_get_num_nameservers (ip_data->ip_config)) {
++				_LOGT ("config: %8d %-7s v%c %-5d %s: %s",
+ 				       prio,
+-				       _config_type_to_string (current->type),
+-				       nm_utils_addr_family_to_char (nm_ip_config_get_addr_family (current->config)),
+-				       current->iface,
++				       _config_type_to_string (ip_data->ip_config_type),
++				       nm_utils_addr_family_to_char (nm_ip_config_get_addr_family (ip_data->ip_config)),
++				       ip_data->data->ifindex,
+ 				       skip ? "<SKIP>" : "",
+-				       get_nameserver_list (current->config, &tmp_gstring));
++				       get_nameserver_list (ip_data->ip_config, &tmp_gstring));
+ 			}
+ 
+ 			if (!skip)
+-				merge_one_ip_config (&rc, current->config, current->iface);
++				merge_one_ip_config (&rc, ip_data->data->ifindex, ip_data->ip_config);
+ 		}
+ 	}
+ 
+@@ -969,16 +1103,16 @@ _collect_resolv_conf_data (NMDnsManager
+ 	 * (eg, "example.com"), then use the hostname itself as the search (since the user is
+ 	 * unlikely to want "com" as a search domain).
+ 	 */
+-	if (hostname) {
+-		const char *hostdomain = strchr (hostname, '.');
++	if (priv->hostname) {
++		const char *hostdomain = strchr (priv->hostname, '.');
+ 
+ 		if (   hostdomain
+-		    && !nm_utils_ipaddr_valid (AF_UNSPEC, hostname)) {
++		    && !nm_utils_ipaddr_valid (AF_UNSPEC, priv->hostname)) {
+ 			hostdomain++;
+ 			if (domain_is_valid (hostdomain, TRUE))
+-				add_string_item (rc.searches, hostdomain);
+-			else if (domain_is_valid (hostname, TRUE))
+-				add_string_item (rc.searches, hostname);
++				add_string_item (rc.searches, hostdomain, TRUE);
++			else if (domain_is_valid (priv->hostname, TRUE))
++				add_string_item (rc.searches, priv->hostname, TRUE);
+ 		}
+ 	}
+ 
+@@ -1000,6 +1134,197 @@ _collect_resolv_conf_data (NMDnsManager
+ 	*out_nis_domain = rc.nis_domain;
+ }
+ 
++static char **
++get_ip_rdns_domains (NMIPConfig *ip_config)
++{
++	int addr_family = nm_ip_config_get_addr_family (ip_config);
++	char **strv;
++	GPtrArray *domains = NULL;
++	NMDedupMultiIter ipconf_iter;
++
++	nm_assert_addr_family (addr_family);
++
++	domains = g_ptr_array_sized_new (5);
++
++	if (addr_family == AF_INET) {
++		NMIP4Config *ip4 = (gpointer) ip_config;
++		const NMPlatformIP4Address *address;
++		const NMPlatformIP4Route *route;
++
++		nm_ip_config_iter_ip4_address_for_each (&ipconf_iter, ip4, &address)
++			nm_utils_get_reverse_dns_domains_ip4 (address->address, address->plen, domains);
++
++		nm_ip_config_iter_ip4_route_for_each (&ipconf_iter, ip4, &route) {
++			if (!NM_PLATFORM_IP_ROUTE_IS_DEFAULT (route))
++				nm_utils_get_reverse_dns_domains_ip4 (route->network, route->plen, domains);
++		}
++	} else {
++		NMIP6Config *ip6 = (gpointer) ip_config;
++		const NMPlatformIP6Address *address;
++		const NMPlatformIP6Route *route;
++
++		nm_ip_config_iter_ip6_address_for_each (&ipconf_iter, ip6, &address)
++			nm_utils_get_reverse_dns_domains_ip6 (&address->address, address->plen, domains);
++
++		nm_ip_config_iter_ip6_route_for_each (&ipconf_iter, ip6, &route) {
++			if (!NM_PLATFORM_IP_ROUTE_IS_DEFAULT (route))
++				nm_utils_get_reverse_dns_domains_ip6 (&route->network, route->plen, domains);
++		}
++	}
++
++	/* Terminating NULL so we can use g_strfreev() to free it */
++	g_ptr_array_add (domains, NULL);
++
++	/* Free the array and return NULL if the only element was the ending NULL */
++	strv = (char **) g_ptr_array_free (domains, (domains->len == 1));
++
++	return _nm_utils_strv_cleanup (strv, FALSE, FALSE, TRUE);
++}
++
++/* Check if the domain is shadowed by a parent domain with more negative priority */
++static gboolean
++domain_is_shadowed (GHashTable *ht,
++                    const char *domain, int priority,
++                    const char **out_parent, int *out_parent_priority)
++{
++	char *parent;
++	int parent_priority;
++
++	nm_assert (!g_hash_table_contains (ht, domain));
++
++	parent_priority = GPOINTER_TO_INT (g_hash_table_lookup (ht, ""));
++	if (parent_priority < 0 && parent_priority < priority) {
++		*out_parent = "";
++		*out_parent_priority = parent_priority;
++		return TRUE;
++	}
++
++	parent = strchr (domain, '.');
++	while (parent && parent[1]) {
++		parent++;
++		parent_priority = GPOINTER_TO_INT (g_hash_table_lookup (ht, parent));
++		if (parent_priority < 0 && parent_priority < priority) {
++			*out_parent = parent;
++			*out_parent_priority = parent_priority;
++			return TRUE;
++		}
++		parent = strchr (parent, '.');
++	}
++
++	return FALSE;
++}
++
++static void
++rebuild_domain_lists (NMDnsManager *self)
++{
++	NMDnsIPConfigData *ip_data;
++	gs_unref_hashtable GHashTable *ht = NULL;
++	gboolean default_route_found = FALSE;
++	CList *head;
++
++	ht = g_hash_table_new (nm_str_hash, g_str_equal);
++
++	head = _ip_config_lst_head (self);
++	c_list_for_each_entry (ip_data, head, ip_config_lst) {
++		NMIPConfig *ip_config = ip_data->ip_config;
++
++		if (!nm_ip_config_get_num_nameservers (ip_config))
++			continue;
++		if (nm_ip_config_best_default_route_get (ip_config)) {
++			default_route_found = TRUE;
++			break;
++		}
++	}
++
++	c_list_for_each_entry (ip_data, head, ip_config_lst) {
++		NMIPConfig *ip_config = ip_data->ip_config;
++		int priority, old_priority;
++		guint i, n, n_domains = 0;
++		const char **domains;
++
++		if (!nm_ip_config_get_num_nameservers (ip_config))
++			continue;
++
++		priority = nm_ip_config_get_dns_priority (ip_config);
++		nm_assert (priority != 0);
++		g_free (ip_data->domains.search);
++		domains = g_new0 (const char *,
++		                  2 + NM_MAX (nm_ip_config_get_num_searches (ip_config),
++		                              nm_ip_config_get_num_domains (ip_config)));
++		ip_data->domains.search = domains;
++
++		/* Add wildcard lookup domain to connections with the default route.
++		 * If there is no default route, add the wildcard domain to all non-VPN
++		 * connections */
++		if (default_route_found) {
++			if (nm_ip_config_best_default_route_get (ip_config))
++				domains[n_domains++] = "~";
++		} else {
++			if (ip_data->ip_config_type != NM_DNS_IP_CONFIG_TYPE_VPN)
++				domains[n_domains++] = "~";
++		}
++
++		/* searches are preferred over domains */
++		n = nm_ip_config_get_num_searches (ip_config);
++		for (i = 0; i < n; i++)
++			domains[n_domains++] = nm_ip_config_get_search (ip_config, i);
++
++		if (n == 0) {
++			/* If not searches, use any domains */
++			n = nm_ip_config_get_num_domains (ip_config);
++			for (i = 0; i < n; i++)
++				domains[n_domains++] = nm_ip_config_get_domain (ip_config, i);
++		}
++
++		n = 0;
++		for (i = 0; i < n_domains; i++) {
++			const char *domain_clean;
++			const char *parent;
++			int parent_priority;
++
++			domain_clean = nm_utils_parse_dns_domain (domains[i], NULL);
++
++			/* Remove domains with lower priority */
++			old_priority = GPOINTER_TO_INT (g_hash_table_lookup (ht, domain_clean));
++			if (old_priority) {
++				if (old_priority < priority) {
++					_LOGT ("plugin: drop domain '%s' (i=%d, p=%d) because it already exists with p=%d",
++					       domains[i], ip_data->data->ifindex,
++					       priority, old_priority);
++					continue;
++				}
++			} else if (domain_is_shadowed (ht, domain_clean, priority, &parent, &parent_priority)) {
++				_LOGT ("plugin: drop domain '%s' (i=%d, p=%d) shadowed by '%s' (p=%d)",
++				       domains[i],
++				       ip_data->data->ifindex, priority,
++				       parent, parent_priority);
++				continue;
++			}
++
++			_LOGT ("plugin: add domain '%s' (i=%d, p=%d)", domains[i], ip_data->data->ifindex, priority);
++			g_hash_table_insert (ht, (gpointer) domain_clean, GINT_TO_POINTER (priority));
++			domains[n++] = domains[i];
++		}
++		domains[n] = NULL;
++
++		g_strfreev (ip_data->domains.reverse);
++		ip_data->domains.reverse = get_ip_rdns_domains (ip_config);
++	}
++}
++
++static void
++clear_domain_lists (NMDnsManager *self)
++{
++	NMDnsIPConfigData *ip_data;
++	CList *head;
++
++	head = _ip_config_lst_head (self);
++	c_list_for_each_entry (ip_data, head, ip_config_lst) {
++		g_clear_pointer (&ip_data->domains.search, g_free);
++		g_clear_pointer (&ip_data->domains.reverse, g_strfreev);
++	}
++}
++
+ static gboolean
+ update_dns (NMDnsManager *self,
+             gboolean no_caching,
+@@ -1040,16 +1365,12 @@ update_dns (NMDnsManager *self,
+ 	data = nm_config_get_data (priv->config);
+ 	global_config = nm_config_data_get_global_dns_config (data);
+ 
+-	if (priv->need_sort) {
+-		g_ptr_array_sort (priv->configs, ip_config_data_ptr_compare);
+-		priv->need_sort = FALSE;
+-	}
+-
+ 	/* Update hash with config we're applying */
+ 	compute_hash (self, global_config, priv->hash);
+ 
+-	_collect_resolv_conf_data (self, global_config, priv->configs, priv->hostname,
+-	                           &searches, &options, &nameservers, &nis_servers, &nis_domain);
++	_collect_resolv_conf_data (self, global_config,
++	                           &searches, &options, &nameservers,
++	                           &nis_servers, &nis_domain);
+ 
+ 	/* Let any plugins do their thing first */
+ 	if (priv->plugin) {
+@@ -1066,9 +1387,10 @@ update_dns (NMDnsManager *self,
+ 		}
+ 
+ 		_LOGD ("update-dns: updating plugin %s", plugin_name);
++		rebuild_domain_lists (self);
+ 		if (!nm_dns_plugin_update (plugin,
+-		                           priv->configs,
+ 		                           global_config,
++		                           _ip_config_lst_head (self),
+ 		                           priv->hostname)) {
+ 			_LOGW ("update-dns: plugin %s update failed", plugin_name);
+ 
+@@ -1077,6 +1399,10 @@ update_dns (NMDnsManager *self,
+ 			 */
+ 			caching = FALSE;
+ 		}
++		/* Clear the generated search list as it points to
++		 * strings owned by IP configurations and we can't
++		 * guarantee they stay alive. */
++		clear_domain_lists (self);
+ 
+ 	skip:
+ 		;
+@@ -1205,82 +1531,96 @@ plugin_child_quit (NMDnsPlugin *plugin,
+ }
+ 
+ static void
+-ip_config_dns_priority_changed (gpointer config,
+-                                GParamSpec *pspec,
+-                                NMDnsManager *self)
+-{
+-	NM_DNS_MANAGER_GET_PRIVATE (self)->need_sort = TRUE;
+-}
+-
+-static void
+-forget_data (NMDnsManager *self, NMDnsIPConfigData *data)
++_ip_config_dns_priority_changed (gpointer config,
++                                 GParamSpec *pspec,
++                                 NMDnsIPConfigData *ip_data)
+ {
+-	NMDnsManagerPrivate *priv = NM_DNS_MANAGER_GET_PRIVATE (self);
+-
+-	if (data == priv->best_conf4)
+-		priv->best_conf4 = NULL;
+-	else if (data == priv->best_conf6)
+-		priv->best_conf6 = NULL;
++	_ASSERT_ip_config_data (ip_data);
+ 
+-	g_signal_handlers_disconnect_by_func (data->config, ip_config_dns_priority_changed, self);
++	NM_DNS_MANAGER_GET_PRIVATE (ip_data->data->self)->ip_config_lst_need_sort = TRUE;
+ }
+ 
+ gboolean
+-nm_dns_manager_add_ip_config (NMDnsManager *self,
+-                              const char *iface,
+-                              gpointer config,
+-                              NMDnsIPConfigType cfg_type)
++nm_dns_manager_set_ip_config (NMDnsManager *self,
++                              NMIPConfig *ip_config,
++                              NMDnsIPConfigType ip_config_type)
+ {
+ 	NMDnsManagerPrivate *priv;
+ 	GError *error = NULL;
+-	NMDnsIPConfigData *data;
+-	gboolean v4 = NM_IS_IP4_CONFIG (config);
+-	guint i;
++	NMDnsIPConfigData *ip_data;
++	NMDnsConfigData *data;
++	int ifindex;
++	NMDnsIPConfigData **p_best;
+ 
+ 	g_return_val_if_fail (NM_IS_DNS_MANAGER (self), FALSE);
+-	g_return_val_if_fail (config, FALSE);
+-	g_return_val_if_fail (iface && iface[0], FALSE);
+-	nm_assert (NM_IS_IP_CONFIG (config));
++	g_return_val_if_fail (NM_IS_IP_CONFIG (ip_config), FALSE);
++
++	ifindex = nm_ip_config_get_ifindex (ip_config);
++	g_return_val_if_fail (ifindex > 0, FALSE);
+ 
+ 	priv = NM_DNS_MANAGER_GET_PRIVATE (self);
+ 
+-	for (i = 0; i < priv->configs->len; i++) {
+-		data = priv->configs->pdata[i];
+-		if (data->config == config) {
+-			if (   nm_streq (data->iface, iface)
+-			    && data->type == cfg_type)
+-				return FALSE;
+-			else {
+-				forget_data (self, data);
+-				g_ptr_array_remove_index_fast (priv->configs, i);
+-				break;
+-			}
+-		}
++	data = g_hash_table_lookup (priv->configs, GINT_TO_POINTER (ifindex));
++	if (!data)
++		ip_data = NULL;
++	else
++		ip_data = _config_data_find_ip_config (data, ip_config);
++
++	if (ip_config_type == NM_DNS_IP_CONFIG_TYPE_REMOVED) {
++		if (!ip_data)
++			return FALSE;
++		if (priv->best_ip_config_4 == ip_data)
++			priv->best_ip_config_4 = NULL;
++		if (priv->best_ip_config_6 == ip_data)
++			priv->best_ip_config_6 = NULL;
++		/* deleting a config doesn't invalidate the configs' sort order. */
++		_ip_config_data_free (ip_data);
++		if (c_list_is_empty (&data->data_lst_head))
++			g_hash_table_remove (priv->configs, GINT_TO_POINTER (ifindex));
++		goto changed;
++	}
++
++	if (   ip_data
++	    && ip_data->ip_config_type == ip_config_type) {
++		/* nothing to do. */
++		return FALSE;
+ 	}
+ 
+-	data = ip_config_data_new (config, cfg_type, iface);
+-	g_ptr_array_add (priv->configs, data);
+-	g_signal_connect (config,
+-	                  v4 ?
+-	                    "notify::" NM_IP4_CONFIG_DNS_PRIORITY :
+-	                    "notify::" NM_IP6_CONFIG_DNS_PRIORITY,
+-	                  (GCallback) ip_config_dns_priority_changed, self);
+-	priv->need_sort = TRUE;
++	if (!data) {
++		data = g_slice_new0 (NMDnsConfigData);
++		data->ifindex = ifindex;
++		data->self = self;
++		c_list_init (&data->data_lst_head);
++		_ASSERT_config_data (data);
++		g_hash_table_insert (priv->configs, GINT_TO_POINTER (ifindex), data);
++	}
++
++	if (!ip_data)
++		ip_data = _ip_config_data_new (data, ip_config, ip_config_type);
++	else
++		ip_data->ip_config_type = ip_config_type;
++
++	priv->ip_config_lst_need_sort = TRUE;
+ 
+-	if (cfg_type == NM_DNS_IP_CONFIG_TYPE_BEST_DEVICE) {
++	p_best = NM_IS_IP4_CONFIG (ip_config)
++	         ? &priv->best_ip_config_4
++	         : &priv->best_ip_config_6;
++
++	if (ip_config_type == NM_DNS_IP_CONFIG_TYPE_BEST_DEVICE) {
+ 		/* Only one best-device per IP version is allowed */
+-		if (v4) {
+-			if (priv->best_conf4)
+-				priv->best_conf4->type = NM_DNS_IP_CONFIG_TYPE_DEFAULT;
+-			priv->best_conf4 = data;
+-		} else {
+-			if (priv->best_conf6)
+-				priv->best_conf6->type = NM_DNS_IP_CONFIG_TYPE_DEFAULT;
+-			priv->best_conf6 = data;
++		if (*p_best != ip_data) {
++			if (*p_best)
++				(*p_best)->ip_config_type = NM_DNS_IP_CONFIG_TYPE_DEFAULT;
++			*p_best = ip_data;
+ 		}
++	} else {
++		if (*p_best == ip_data)
++			*p_best = NULL;
+ 	}
+ 
+-	if (!priv->updates_queue && !update_dns (self, FALSE, &error)) {
++changed:
++	if (   !priv->updates_queue
++	    && !update_dns (self, FALSE, &error)) {
+ 		_LOGW ("could not commit DNS changes: %s", error->message);
+ 		g_clear_error (&error);
+ 	}
+@@ -1288,38 +1628,6 @@ nm_dns_manager_add_ip_config (NMDnsManag
+ 	return TRUE;
+ }
+ 
+-gboolean
+-nm_dns_manager_remove_ip_config (NMDnsManager *self, gpointer config)
+-{
+-	NMDnsManagerPrivate *priv;
+-	GError *error = NULL;
+-	NMDnsIPConfigData *data;
+-	guint i;
+-
+-	g_return_val_if_fail (NM_IS_DNS_MANAGER (self), FALSE);
+-	g_return_val_if_fail (config, FALSE);
+-	nm_assert (NM_IS_IP_CONFIG (config));
+-
+-	priv = NM_DNS_MANAGER_GET_PRIVATE (self);
+-
+-	for (i = 0; i < priv->configs->len; i++) {
+-		data = priv->configs->pdata[i];
+-
+-		if (data->config == config) {
+-			forget_data (self, data);
+-			g_ptr_array_remove_index (priv->configs, i);
+-
+-			if (!priv->updates_queue && !update_dns (self, FALSE, &error)) {
+-				_LOGW ("could not commit DNS changes: %s", error->message);
+-				g_clear_error (&error);
+-			}
+-
+-			return TRUE;
+-		}
+-	}
+-	return FALSE;
+-}
+-
+ void
+ nm_dns_manager_set_initial_hostname (NMDnsManager *self,
+                                      const char *hostname)
+@@ -1409,11 +1717,6 @@ nm_dns_manager_end_updates (NMDnsManager
+ 	priv = NM_DNS_MANAGER_GET_PRIVATE (self);
+ 	g_return_if_fail (priv->updates_queue > 0);
+ 
+-	if (priv->need_sort) {
+-		g_ptr_array_sort (priv->configs, ip_config_data_ptr_compare);
+-		priv->need_sort = FALSE;
+-	}
+-
+ 	compute_hash (self, nm_config_data_get_global_dns_config (nm_config_get_data (priv->config)), new);
+ 	changed = (memcmp (new, priv->prev_hash, sizeof (new)) != 0) ? TRUE : FALSE;
+ 	_LOGD ("(%s): DNS configuration %s", func, changed ? "changed" : "did not change");
+@@ -1810,14 +2113,14 @@ _get_config_variant (NMDnsManager *self)
+ 	NMGlobalDnsConfig *global_config;
+ 	gs_free char *str = NULL;
+ 	GVariantBuilder builder;
+-	NMConfigData *data;
+-	guint i, j;
++	NMDnsIPConfigData *ip_data;
++	const CList *head;
++	gs_unref_ptrarray GPtrArray *array_domains = NULL;
+ 
+ 	if (priv->config_variant)
+ 		return priv->config_variant;
+ 
+-	data = nm_config_get_data (priv->config);
+-	global_config = nm_config_data_get_global_dns_config (data);
++	global_config = nm_config_data_get_global_dns_config (nm_config_get_data (priv->config));
+ 	if (global_config) {
+ 		priv->config_variant = _get_global_config_variant (global_config);
+ 		_LOGT ("current configuration: %s", (str = g_variant_print (priv->config_variant, TRUE)));
+@@ -1826,25 +2129,26 @@ _get_config_variant (NMDnsManager *self)
+ 
+ 	g_variant_builder_init (&builder, G_VARIANT_TYPE ("aa{sv}"));
+ 
+-	for (i = 0; i < priv->configs->len; i++) {
+-		NMDnsIPConfigData *current = priv->configs->pdata[i];
+-		const NMIPConfig *config = current->config;
++	head = _ip_config_lst_head (self);
++	c_list_for_each_entry (ip_data, head, ip_config_lst) {
++		const NMIPConfig *ip_config = ip_data->ip_config;
+ 		GVariantBuilder entry_builder;
+ 		GVariantBuilder strv_builder;
+-		guint num;
+-		const int addr_family = nm_ip_config_get_addr_family (config);
++		guint i, num;
++		const int addr_family = nm_ip_config_get_addr_family (ip_config);
+ 		char buf[NM_UTILS_INET_ADDRSTRLEN];
+ 		const NMIPAddr *addr;
++		const char *ifname;
+ 
+-		num = nm_ip_config_get_num_nameservers (config);
++		num = nm_ip_config_get_num_nameservers (ip_config);
+ 		if (!num)
+ 			continue;
+ 
+ 		g_variant_builder_init (&entry_builder, G_VARIANT_TYPE ("a{sv}"));
+ 
+ 		g_variant_builder_init (&strv_builder, G_VARIANT_TYPE ("as"));
+-		for (j = 0; j < num; j++) {
+-			addr = nm_ip_config_get_nameserver (config, j);
++		for (i = 0; i < num; i++) {
++			addr = nm_ip_config_get_nameserver (ip_config, i);
+ 			g_variant_builder_add (&strv_builder,
+ 			                       "s",
+ 			                       nm_utils_inet_ntop (addr_family, addr, buf));
+@@ -1854,36 +2158,47 @@ _get_config_variant (NMDnsManager *self)
+ 		                       "nameservers",
+ 		                       g_variant_builder_end (&strv_builder));
+ 
+-		num = nm_ip_config_get_num_domains (config);
++
++		num = nm_ip_config_get_num_domains (ip_config);
++		num += nm_ip_config_get_num_searches (ip_config);
+ 		if (num > 0) {
+-			g_variant_builder_init (&strv_builder, G_VARIANT_TYPE ("as"));
+-			for (j = 0; j < num; j++) {
+-				g_variant_builder_add (&strv_builder,
+-				                       "s",
+-				                       nm_ip_config_get_domain (config, j));
++			if (!array_domains)
++				array_domains = g_ptr_array_sized_new (num);
++			else
++				g_ptr_array_set_size (array_domains, 0);
++
++			add_dns_domains (array_domains, ip_config, TRUE, FALSE);
++			if (array_domains->len) {
++				g_variant_builder_init (&strv_builder, G_VARIANT_TYPE ("as"));
++				for (i = 0; i < array_domains->len; i++) {
++					g_variant_builder_add (&strv_builder,
++					                       "s",
++					                       array_domains->pdata[i]);
++				}
++				g_variant_builder_add (&entry_builder,
++				                       "{sv}",
++				                       "domains",
++				                       g_variant_builder_end (&strv_builder));
+ 			}
+-			g_variant_builder_add (&entry_builder,
+-			                       "{sv}",
+-			                       "domains",
+-			                       g_variant_builder_end (&strv_builder));
+ 		}
+ 
+-		if (current->iface) {
++		ifname = nm_platform_link_get_name (NM_PLATFORM_GET, ip_data->data->ifindex);
++		if (ifname) {
+ 			g_variant_builder_add (&entry_builder,
+ 			                       "{sv}",
+ 			                       "interface",
+-			                       g_variant_new_string (current->iface));
++			                       g_variant_new_string (ifname));
+ 		}
+ 
+ 		g_variant_builder_add (&entry_builder,
+ 		                       "{sv}",
+ 		                       "priority",
+-		                       g_variant_new_int32 (nm_ip_config_get_dns_priority (config)));
++		                       g_variant_new_int32 (nm_ip_config_get_dns_priority (ip_config)));
+ 
+ 		g_variant_builder_add (&entry_builder,
+ 		                       "{sv}",
+ 		                       "vpn",
+-		                       g_variant_new_boolean (current->type == NM_DNS_IP_CONFIG_TYPE_VPN));
++		                       g_variant_new_boolean (ip_data->ip_config_type == NM_DNS_IP_CONFIG_TYPE_VPN));
+ 
+ 		g_variant_builder_add (&builder, "a{sv}", &entry_builder);
+ 	}
+@@ -1924,8 +2239,12 @@ nm_dns_manager_init (NMDnsManager *self)
+ 
+ 	_LOGT ("creating...");
+ 
++	c_list_init (&priv->ip_config_lst_head);
++
+ 	priv->config = g_object_ref (nm_config_get ());
+-	priv->configs = g_ptr_array_new_full (8, ip_config_data_destroy);
++
++	priv->configs = g_hash_table_new_full (nm_direct_hash, NULL,
++	                                       NULL, (GDestroyNotify) _config_data_free);
+ 
+ 	/* Set the initial hash */
+ 	compute_hash (self, NULL, NM_DNS_MANAGER_GET_PRIVATE (self)->hash);
+@@ -1942,32 +2261,30 @@ dispose (GObject *object)
+ {
+ 	NMDnsManager *self = NM_DNS_MANAGER (object);
+ 	NMDnsManagerPrivate *priv = NM_DNS_MANAGER_GET_PRIVATE (self);
+-	NMDnsIPConfigData *data;
+-	guint i;
++	NMDnsIPConfigData *ip_data, *ip_data_safe;
+ 
+ 	_LOGT ("disposing");
+ 
+ 	if (!priv->is_stopped)
+ 		nm_dns_manager_stop (self);
+ 
++	if (priv->config)
++		g_signal_handlers_disconnect_by_func (priv->config, config_changed_cb, self);
++
+ 	_clear_plugin (self);
+ 
+-	if (priv->config) {
+-		g_signal_handlers_disconnect_by_func (priv->config, config_changed_cb, self);
+-		g_clear_object (&priv->config);
+-	}
++	priv->best_ip_config_4 = NULL;
++	priv->best_ip_config_6 = NULL;
+ 
+-	if (priv->configs) {
+-		for (i = 0; i < priv->configs->len; i++) {
+-			data = priv->configs->pdata[i];
+-			forget_data (self, data);
+-		}
+-		g_ptr_array_free (priv->configs, TRUE);
+-		priv->configs = NULL;
+-	}
++	c_list_for_each_entry_safe (ip_data, ip_data_safe, &priv->ip_config_lst_head, ip_config_lst)
++		_ip_config_data_free (ip_data);
++
++	g_clear_pointer (&priv->configs, g_hash_table_destroy);
+ 
+ 	nm_clear_g_source (&priv->plugin_ratelimit.timer);
+ 
++	g_clear_object (&priv->config);
++
+ 	G_OBJECT_CLASS (nm_dns_manager_parent_class)->dispose (object);
+ }
+ 
+@@ -2029,4 +2346,3 @@ nm_dns_manager_class_init (NMDnsManagerC
+ 	                                        NMDBUS_TYPE_DNS_MANAGER_SKELETON,
+ 	                                        NULL);
+ }
+-
+--- network-manager-1.10.6.orig/src/dns/nm-dns-manager.h
++++ network-manager-1.10.6/src/dns/nm-dns-manager.h
+@@ -26,11 +26,14 @@
+ 
+ #include "nm-ip4-config.h"
+ #include "nm-ip6-config.h"
++#include "nm-setting-connection.h"
+ 
+ typedef enum {
++	NM_DNS_IP_CONFIG_TYPE_REMOVED = -1,
++
+ 	NM_DNS_IP_CONFIG_TYPE_DEFAULT = 0,
+ 	NM_DNS_IP_CONFIG_TYPE_BEST_DEVICE,
+-	NM_DNS_IP_CONFIG_TYPE_VPN
++	NM_DNS_IP_CONFIG_TYPE_VPN,
+ } NMDnsIPConfigType;
+ 
+ enum {
+@@ -38,12 +41,27 @@ enum {
+ 	NM_DNS_PRIORITY_DEFAULT_VPN     = 50,
+ };
+ 
++struct _NMDnsConfigData;
++struct _NMDnsManager;
++
+ typedef struct {
+-	gpointer config;
+-	NMDnsIPConfigType type;
+-	char *iface;
++	struct _NMDnsConfigData *data;
++	NMIPConfig *ip_config;
++	CList data_lst;
++	CList ip_config_lst;
++	NMDnsIPConfigType ip_config_type;
++	struct {
++		const char **search;
++		char **reverse;
++	} domains;
+ } NMDnsIPConfigData;
+ 
++typedef struct _NMDnsConfigData {
++	struct _NMDnsManager *self;
++	CList data_lst_head;
++	int ifindex;
++} NMDnsConfigData;
++
+ #define NM_TYPE_DNS_MANAGER (nm_dns_manager_get_type ())
+ #define NM_DNS_MANAGER(o) (G_TYPE_CHECK_INSTANCE_CAST ((o), NM_TYPE_DNS_MANAGER, NMDnsManager))
+ #define NM_DNS_MANAGER_CLASS(k) (G_TYPE_CHECK_CLASS_CAST((k), NM_TYPE_DNS_MANAGER, NMDnsManagerClass))
+@@ -70,12 +88,9 @@ NMDnsManager * nm_dns_manager_get (void)
+ void nm_dns_manager_begin_updates (NMDnsManager *self, const char *func);
+ void nm_dns_manager_end_updates (NMDnsManager *self, const char *func);
+ 
+-gboolean nm_dns_manager_add_ip_config (NMDnsManager *self,
+-                                       const char *iface,
+-                                       gpointer config,
+-                                       NMDnsIPConfigType cfg_type);
+-
+-gboolean nm_dns_manager_remove_ip_config (NMDnsManager *self, gpointer config);
++gboolean nm_dns_manager_set_ip_config (NMDnsManager *self,
++                                       NMIPConfig *ip_config,
++                                       NMDnsIPConfigType ip_config_type);
+ 
+ void nm_dns_manager_set_initial_hostname (NMDnsManager *self,
+                                           const char *hostname);
+--- network-manager-1.10.6.orig/src/dns/nm-dns-plugin.c
++++ network-manager-1.10.6/src/dns/nm-dns-plugin.c
+@@ -77,15 +77,15 @@ G_DEFINE_TYPE_EXTENDED (NMDnsPlugin, nm_
+ 
+ gboolean
+ nm_dns_plugin_update (NMDnsPlugin *self,
+-                      const GPtrArray *configs,
+                       const NMGlobalDnsConfig *global_config,
++                      const CList *ip_config_lst_head,
+                       const char *hostname)
+ {
+ 	g_return_val_if_fail (NM_DNS_PLUGIN_GET_CLASS (self)->update != NULL, FALSE);
+ 
+ 	return NM_DNS_PLUGIN_GET_CLASS (self)->update (self,
+-	                                               configs,
+ 	                                               global_config,
++	                                               ip_config_lst_head,
+ 	                                               hostname);
+ }
+ 
+--- network-manager-1.10.6.orig/src/dns/nm-dns-plugin.h
++++ network-manager-1.10.6/src/dns/nm-dns-plugin.h
+@@ -50,8 +50,8 @@ typedef struct {
+ 	 * configuration.
+ 	 */
+ 	gboolean (*update) (NMDnsPlugin *self,
+-	                    const GPtrArray *configs,
+ 	                    const NMGlobalDnsConfig *global_config,
++	                    const CList *ip_config_lst_head,
+ 	                    const char *hostname);
+ 
+ 	/* Subclasses should override and return TRUE if they start a local
+@@ -80,8 +80,8 @@ gboolean nm_dns_plugin_is_caching (NMDns
+ const char *nm_dns_plugin_get_name (NMDnsPlugin *self);
+ 
+ gboolean nm_dns_plugin_update (NMDnsPlugin *self,
+-                               const GPtrArray *configs,
+                                const NMGlobalDnsConfig *global_config,
++                               const CList *ip_config_lst_head,
+                                const char *hostname);
+ 
+ void nm_dns_plugin_stop (NMDnsPlugin *self);
+--- network-manager-1.10.6.orig/src/dns/nm-dns-systemd-resolved.c
++++ network-manager-1.10.6/src/dns/nm-dns-systemd-resolved.c
+@@ -31,6 +31,7 @@
+ #include <sys/stat.h>
+ #include <linux/if.h>
+ 
++#include "nm-utils/nm-c-list.h"
+ #include "nm-core-internal.h"
+ #include "platform/nm-platform.h"
+ #include "nm-utils.h"
+@@ -38,6 +39,7 @@
+ #include "nm-ip6-config.h"
+ #include "nm-bus-manager.h"
+ #include "nm-manager.h"
++#include "nm-setting-connection.h"
+ #include "devices/nm-device.h"
+ #include "NetworkManagerUtils.h"
+ 
+@@ -48,17 +50,23 @@
+ 
+ typedef struct {
+ 	int ifindex;
+-	GList *configs;
++	CList configs_lst_head;
+ } InterfaceConfig;
+ 
++typedef struct {
++	CList request_queue_lst;
++	const char *operation;
++	GVariant *argument;
++} RequestItem;
++
+ /*****************************************************************************/
+ 
+ typedef struct {
+ 	GDBusProxy *resolve;
+ 	GCancellable *init_cancellable;
+ 	GCancellable *update_cancellable;
+-	GQueue dns_updates;
+-	GQueue domain_updates;
++	GCancellable *mdns_cancellable;
++	CList request_queue_lst_head;
+ } NMDnsSystemdResolvedPrivate;
+ 
+ struct _NMDnsSystemdResolved {
+@@ -82,6 +90,36 @@ G_DEFINE_TYPE (NMDnsSystemdResolved, nm_
+ /*****************************************************************************/
+ 
+ static void
++_request_item_free (RequestItem *request_item)
++{
++	c_list_unlink_stale (&request_item->request_queue_lst);
++	g_variant_unref (request_item->argument);
++	g_slice_free (RequestItem, request_item);
++}
++
++static void
++_request_item_append (CList *request_queue_lst_head,
++                      const char *operation,
++                      GVariant *argument)
++{
++	RequestItem *request_item;
++
++	request_item = g_slice_new (RequestItem);
++	request_item->operation = operation;
++	request_item->argument = g_variant_ref_sink (argument);
++	c_list_link_tail (request_queue_lst_head, &request_item->request_queue_lst);
++}
++
++/*****************************************************************************/
++
++static void
++_interface_config_free (InterfaceConfig *config)
++{
++	nm_c_list_elem_free_all (&config->configs_lst_head, NULL);
++	g_slice_free (InterfaceConfig, config);
++}
++
++static void
+ call_done (GObject *source, GAsyncResult *r, gpointer user_data)
+ {
+ 	GVariant *v;
+@@ -100,111 +138,39 @@ call_done (GObject *source, GAsyncResult
+ }
+ 
+ static void
+-add_interface_configuration (NMDnsSystemdResolved *self,
+-                             GArray *interfaces,
+-                             const NMDnsIPConfigData *data,
+-                             gboolean skip)
+-{
+-	int i;
+-	InterfaceConfig *ic = NULL;
+-	int ifindex;
+-
+-	if (NM_IS_IP4_CONFIG (data->config))
+-		ifindex = nm_ip4_config_get_ifindex (data->config);
+-	else if (NM_IS_IP6_CONFIG  (data->config))
+-		ifindex = nm_ip6_config_get_ifindex (data->config);
+-	else
+-		g_return_if_reached ();
+-
+-	for (i = 0; i < interfaces->len; i++) {
+-		InterfaceConfig *tic = &g_array_index (interfaces, InterfaceConfig, i);
+-		if (ifindex == tic->ifindex) {
+-			ic = tic;
+-			break;
+-		}
+-	}
+-
+-	if (!ic) {
+-		g_array_set_size (interfaces, interfaces->len + 1);
+-		ic = &g_array_index (interfaces, InterfaceConfig,
+-		                     interfaces->len - 1);
+-		ic->ifindex = ifindex;
+-	}
+-
+-	if (!skip)
+-		ic->configs = g_list_append (ic->configs, data->config);
+-}
+-
+-static void
+ update_add_ip_config (NMDnsSystemdResolved *self,
+                       GVariantBuilder *dns,
+                       GVariantBuilder *domains,
+-                      gpointer config)
++                      NMDnsIPConfigData *data)
+ {
+ 	int addr_family;
+ 	gsize addr_size;
+ 	guint i, n;
+ 	gboolean is_routing;
++	const char **iter;
+ 	const char *domain;
+ 
+-	if (NM_IS_IP4_CONFIG (config))
+-		addr_family = AF_INET;
+-	else if (NM_IS_IP6_CONFIG (config))
+-		addr_family = AF_INET6;
+-	else
+-		g_return_if_reached ();
+-
++	addr_family = nm_ip_config_get_addr_family (data->ip_config);
+ 	addr_size = nm_utils_addr_family_to_size (addr_family);
+ 
+-	n =   addr_family == AF_INET
+-	    ? nm_ip4_config_get_num_nameservers (config)
+-	    : nm_ip6_config_get_num_nameservers (config);
+-	for (i = 0 ; i < n; i++) {
+-		in_addr_t ns4;
+-		gconstpointer ns;
+-
+-		if (addr_family == AF_INET) {
+-			ns4 = nm_ip4_config_get_nameserver (config, i);
+-			ns = &ns4;
+-		} else
+-			ns = nm_ip6_config_get_nameserver (config, i);
++	if (!data->domains.search  || !data->domains.search[0])
++		return;
+ 
++	n = nm_ip_config_get_num_nameservers (data->ip_config);
++	for (i = 0 ; i < n; i++) {
+ 		g_variant_builder_open (dns, G_VARIANT_TYPE ("(iay)"));
+ 		g_variant_builder_add (dns, "i", addr_family);
+ 		g_variant_builder_add_value (dns,
+ 		                             g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE,
+-		                                                        ns,
++		                                                        nm_ip_config_get_nameserver (data->ip_config, i),
+ 		                                                        addr_size,
+ 		                                                        1));
+ 		g_variant_builder_close (dns);
+ 	}
+ 
+-	n =   addr_family == AF_INET
+-	    ? nm_ip4_config_get_num_searches (config)
+-	    : nm_ip6_config_get_num_searches (config);
+-	if (n  > 0) {
+-		for (i = 0; i < n; i++) {
+-			domain = nm_utils_parse_dns_domain (addr_family == AF_INET
+-			                                    ? nm_ip4_config_get_search (config, i)
+-			                                    : nm_ip6_config_get_search (config, i),
+-			                                    &is_routing);
+-			g_variant_builder_add (domains, "(sb)",
+-			                       domain,
+-			                       is_routing);
+-		}
+-	} else {
+-		n =   addr_family == AF_INET
+-		    ? nm_ip4_config_get_num_domains (config)
+-		    : nm_ip6_config_get_num_domains (config);
+-		for (i = 0; i < n; i++) {
+-			domain = nm_utils_parse_dns_domain (addr_family == AF_INET
+-			                                    ? nm_ip4_config_get_domain (config, i)
+-			                                    : nm_ip6_config_get_domain (config, i),
+-			                                    &is_routing);
+-			g_variant_builder_add (domains, "(sb)",
+-			                       domain,
+-			                       is_routing);
+-		}
++	for (iter = data->domains.search; *iter; iter++) {
++		domain = nm_utils_parse_dns_domain (*iter, &is_routing);
++		g_variant_builder_add (domains, "(sb)", domain[0] ? domain : ".", is_routing);
+ 	}
+ }
+ 
+@@ -212,13 +178,13 @@ static void
+ free_pending_updates (NMDnsSystemdResolved *self)
+ {
+ 	NMDnsSystemdResolvedPrivate *priv = NM_DNS_SYSTEMD_RESOLVED_GET_PRIVATE (self);
+-	GVariant *v;
++	RequestItem *request_item, *request_item_safe;
+ 
+-	while ((v = g_queue_pop_head (&priv->dns_updates)) != NULL)
+-		g_variant_unref (v);
+-
+-	while ((v = g_queue_pop_head (&priv->domain_updates)) != NULL)
+-		g_variant_unref (v);
++	c_list_for_each_entry_safe (request_item,
++	                            request_item_safe,
++	                            &priv->request_queue_lst_head,
++	                            request_queue_lst)
++		_request_item_free (request_item);
+ }
+ 
+ static void
+@@ -226,7 +192,9 @@ prepare_one_interface (NMDnsSystemdResol
+ {
+ 	NMDnsSystemdResolvedPrivate *priv = NM_DNS_SYSTEMD_RESOLVED_GET_PRIVATE (self);
+ 	GVariantBuilder dns, domains;
+-	GList *l;
++	NMCListElem *elem;
++	NMSettingConnectionMdns mdns = NM_SETTING_CONNECTION_MDNS_DEFAULT;
++	const char *mdns_arg = NULL;
+ 
+ 	g_variant_builder_init (&dns, G_VARIANT_TYPE ("(ia(iay))"));
+ 	g_variant_builder_add (&dns, "i", ic->ifindex);
+@@ -236,23 +204,51 @@ prepare_one_interface (NMDnsSystemdResol
+ 	g_variant_builder_add (&domains, "i", ic->ifindex);
+ 	g_variant_builder_open (&domains, G_VARIANT_TYPE ("a(sb)"));
+ 
+-	for (l = ic->configs; l; l = l->next)
+-		update_add_ip_config (self, &dns, &domains, l->data);
++	c_list_for_each_entry (elem, &ic->configs_lst_head, lst) {
++		NMDnsIPConfigData *data = elem->data;
++		NMIPConfig *ip_config = data->ip_config;
++
++		update_add_ip_config (self, &dns, &domains, data);
++
++		if (NM_IS_IP4_CONFIG (ip_config))
++			mdns = NM_MAX (mdns, nm_ip4_config_mdns_get (NM_IP4_CONFIG (ip_config)));
++	}
+ 
+ 	g_variant_builder_close (&dns);
+ 	g_variant_builder_close (&domains);
+ 
+-	g_queue_push_tail (&priv->dns_updates,
+-	                   g_variant_ref_sink (g_variant_builder_end (&dns)));
+-	g_queue_push_tail (&priv->domain_updates,
+-	                   g_variant_ref_sink (g_variant_builder_end (&domains)));
++	switch (mdns) {
++	case NM_SETTING_CONNECTION_MDNS_NO:
++		mdns_arg = "no";
++		break;
++	case NM_SETTING_CONNECTION_MDNS_RESOLVE:
++		mdns_arg = "resolve";
++		break;
++	case NM_SETTING_CONNECTION_MDNS_YES:
++		mdns_arg = "yes";
++		break;
++	case NM_SETTING_CONNECTION_MDNS_DEFAULT:
++		mdns_arg = "";
++		break;
++	}
++	nm_assert (mdns_arg);
++
++	_request_item_append (&priv->request_queue_lst_head,
++	                      "SetLinkDNS",
++	                      g_variant_builder_end (&dns));
++	_request_item_append (&priv->request_queue_lst_head,
++	                      "SetLinkDomains",
++	                      g_variant_builder_end (&domains));
++	_request_item_append (&priv->request_queue_lst_head,
++	                      "SetLinkMulticastDNS",
++	                      g_variant_new ("(is)", ic->ifindex, mdns_arg ?: ""));
+ }
+ 
+ static void
+ send_updates (NMDnsSystemdResolved *self)
+ {
+ 	NMDnsSystemdResolvedPrivate *priv = NM_DNS_SYSTEMD_RESOLVED_GET_PRIVATE (self);
+-	GVariant *v;
++	RequestItem *request_item, *request_item_safe;
+ 
+ 	nm_clear_g_cancellable (&priv->update_cancellable);
+ 
+@@ -261,55 +257,73 @@ send_updates (NMDnsSystemdResolved *self
+ 
+ 	priv->update_cancellable = g_cancellable_new ();
+ 
+-	while ((v = g_queue_pop_head (&priv->dns_updates)) != NULL) {
+-		g_dbus_proxy_call (priv->resolve, "SetLinkDNS", v,
+-		                   G_DBUS_CALL_FLAGS_NONE,
+-		                   -1, priv->update_cancellable, call_done, self);
+-		g_variant_unref (v);
+-	}
+-
+-	while ((v = g_queue_pop_head (&priv->domain_updates)) != NULL) {
+-		g_dbus_proxy_call (priv->resolve, "SetLinkDomains", v,
++	c_list_for_each_entry_safe (request_item,
++	                            request_item_safe,
++	                            &priv->request_queue_lst_head,
++	                            request_queue_lst) {
++		g_dbus_proxy_call (priv->resolve,
++		                   request_item->operation,
++		                   request_item->argument,
+ 		                   G_DBUS_CALL_FLAGS_NONE,
+-		                   -1, priv->update_cancellable, call_done, self);
+-		g_variant_unref (v);
++		                   -1,
++		                   priv->update_cancellable,
++		                   call_done,
++		                   self);
++		_request_item_free (request_item);
+ 	}
+ }
+ 
+ static gboolean
+ update (NMDnsPlugin *plugin,
+-        const GPtrArray *configs,
+         const NMGlobalDnsConfig *global_config,
++        const CList *ip_config_lst_head,
+         const char *hostname)
+ {
+ 	NMDnsSystemdResolved *self = NM_DNS_SYSTEMD_RESOLVED (plugin);
+-	GArray *interfaces = g_array_new (TRUE, TRUE, sizeof (InterfaceConfig));
++	gs_unref_hashtable GHashTable *interfaces = NULL;
++	gs_free gpointer *interfaces_keys = NULL;
++	guint interfaces_len;
+ 	guint i;
+-	int prio, first_prio = 0;
++	NMDnsIPConfigData *ip_data;
++
++	interfaces = g_hash_table_new_full (nm_direct_hash, NULL,
++	                                    NULL, (GDestroyNotify) _interface_config_free);
++
++	c_list_for_each_entry (ip_data, ip_config_lst_head, ip_config_lst) {
++		InterfaceConfig *ic = NULL;
++		int ifindex;
++
++		ifindex = ip_data->data->ifindex;
++		nm_assert (ifindex == nm_ip_config_get_ifindex (ip_data->ip_config));
++
++		ic = g_hash_table_lookup (interfaces, GINT_TO_POINTER (ifindex));
++		if (!ic) {
++			ic = g_slice_new (InterfaceConfig);
++			ic->ifindex = ifindex;
++			c_list_init (&ic->configs_lst_head);
++			g_hash_table_insert (interfaces, GINT_TO_POINTER (ifindex), ic);
++		}
+ 
+-	for (i = 0; i < configs->len; i++) {
+-		const NMDnsIPConfigData *data = configs->pdata[i];
+-		gboolean skip = FALSE;
+-
+-		prio = nm_ip_config_get_dns_priority (data->config);
+-		if (i == 0)
+-			first_prio = prio;
+-		else if (first_prio < 0 && first_prio != prio)
+-			skip = TRUE;
+-		add_interface_configuration (self, interfaces, data, skip);
++		c_list_link_tail (&ic->configs_lst_head,
++		                  &nm_c_list_elem_new_stale (ip_data)->lst);
+ 	}
+ 
+ 	free_pending_updates (self);
+ 
+-	for (i = 0; i < interfaces->len; i++) {
+-		InterfaceConfig *ic = &g_array_index (interfaces, InterfaceConfig, i);
++	interfaces_keys = g_hash_table_get_keys_as_array (interfaces, &interfaces_len);
++	if (interfaces_len > 1) {
++		g_qsort_with_data (interfaces_keys,
++		                   interfaces_len,
++		                   sizeof (gpointer),
++		                   nm_cmp_int2ptr_p_with_data,
++		                   NULL);
++	}
++	for (i = 0; i < interfaces_len; i++) {
++		InterfaceConfig *ic = g_hash_table_lookup (interfaces, GINT_TO_POINTER (interfaces_keys[i]));
+ 
+ 		prepare_one_interface (self, ic);
+-		g_list_free (ic->configs);
+ 	}
+ 
+-	g_array_free (interfaces, TRUE);
+-
+ 	send_updates (self);
+ 
+ 	return TRUE;
+@@ -365,8 +379,7 @@ nm_dns_systemd_resolved_init (NMDnsSyste
+ 	NMBusManager *dbus_mgr;
+ 	GDBusConnection *connection;
+ 
+-	g_queue_init (&priv->dns_updates);
+-	g_queue_init (&priv->domain_updates);
++	c_list_init (&priv->request_queue_lst_head);
+ 
+ 	dbus_mgr = nm_bus_manager_get ();
+ 	g_return_if_fail (dbus_mgr);
+@@ -403,6 +416,7 @@ dispose (GObject *object)
+ 	g_clear_object (&priv->resolve);
+ 	nm_clear_g_cancellable (&priv->init_cancellable);
+ 	nm_clear_g_cancellable (&priv->update_cancellable);
++	nm_clear_g_cancellable (&priv->mdns_cancellable);
+ 
+ 	G_OBJECT_CLASS (nm_dns_systemd_resolved_parent_class)->dispose (object);
+ }
+--- network-manager-1.10.6.orig/src/dns/nm-dns-unbound.c
++++ network-manager-1.10.6/src/dns/nm-dns-unbound.c
+@@ -39,8 +39,8 @@ G_DEFINE_TYPE (NMDnsUnbound, nm_dns_unbo
+ 
+ static gboolean
+ update (NMDnsPlugin *plugin,
+-        const GPtrArray *configs,
+         const NMGlobalDnsConfig *global_config,
++        const CList *ip_config_lst_head,
+         const char *hostname)
+ {
+ 	char *argv[] = { DNSSEC_TRIGGER_SCRIPT, "--async", "--update", NULL };
+--- network-manager-1.10.6.orig/src/nm-ip4-config.c
++++ network-manager-1.10.6/src/nm-ip4-config.c
+@@ -293,6 +293,7 @@ typedef struct {
+ 	int ifindex;
+ 	NMIPConfigSource mtu_source;
+ 	gint dns_priority;
++	NMSettingConnectionMdns mdns;
+ 	GArray *nameservers;
+ 	GPtrArray *domains;
+ 	GPtrArray *searches;
+@@ -893,6 +894,7 @@ _nm_ip_config_merge_route_attributes (in
+ void
+ nm_ip4_config_merge_setting (NMIP4Config *self,
+                              NMSettingIPConfig *setting,
++                             NMSettingConnectionMdns mdns,
+                              guint32 route_table,
+                              guint32 route_metric)
+ {
+@@ -1012,6 +1014,8 @@ nm_ip4_config_merge_setting (NMIP4Config
+ 	if (priority)
+ 		nm_ip4_config_set_dns_priority (self, priority);
+ 
++	nm_ip4_config_mdns_set (self, mdns);
++
+ 	g_object_thaw_notify (G_OBJECT (self));
+ }
+ 
+@@ -1227,6 +1231,11 @@ nm_ip4_config_merge (NMIP4Config *dst,
+ 	if (nm_ip4_config_get_dns_priority (src))
+ 		nm_ip4_config_set_dns_priority (dst, nm_ip4_config_get_dns_priority (src));
+ 
++	/* mdns */
++	nm_ip4_config_mdns_set (dst,
++	                        NM_MAX (nm_ip4_config_mdns_get (src),
++	                                nm_ip4_config_mdns_get (dst)));
++
+ 	g_object_thaw_notify (G_OBJECT (dst));
+ }
+ 
+@@ -1463,6 +1472,10 @@ nm_ip4_config_subtract (NMIP4Config *dst
+ 	if (nm_ip4_config_get_dns_priority (src) == nm_ip4_config_get_dns_priority (dst))
+ 		nm_ip4_config_set_dns_priority (dst, 0);
+ 
++	/* mdns */
++	if (nm_ip4_config_mdns_get (src) == nm_ip4_config_mdns_get (dst))
++		nm_ip4_config_mdns_set (dst, NM_SETTING_CONNECTION_MDNS_DEFAULT);
++
+ 	g_object_thaw_notify (G_OBJECT (dst));
+ }
+ 
+@@ -1550,6 +1563,7 @@ nm_ip4_config_intersect (NMIP4Config *ds
+ 	/* ignore dns options */
+ 	/* ignore NIS */
+ 	/* ignore WINS */
++	/* ignore mdns */
+ 
+ 	g_object_thaw_notify (G_OBJECT (dst));
+ }
+@@ -1779,6 +1793,8 @@ nm_ip4_config_replace (NMIP4Config *dst,
+ 		has_relevant_changes = TRUE;
+ 	}
+ 
++	dst_priv->mdns = src_priv->mdns;
++
+ 	/* DNS priority */
+ 	if (src_priv->dns_priority != dst_priv->dns_priority) {
+ 		nm_ip4_config_set_dns_priority (dst, src_priv->dns_priority);
+@@ -2270,6 +2286,31 @@ _nm_ip4_config_get_nameserver (const NMI
+ 
+ /*****************************************************************************/
+ 
++gboolean
++_nm_ip_config_check_and_add_domain (GPtrArray *array, const char *domain)
++{
++	char *copy = NULL;
++	size_t len;
++
++	g_return_val_if_fail (domain, FALSE);
++	g_return_val_if_fail (domain[0] != '\0', FALSE);
++
++	if (domain[0] == '.' || strstr (domain, ".."))
++		return FALSE;
++
++	len = strlen (domain);
++	if (domain[len - 1] == '.')
++		domain = copy = g_strndup (domain, len - 1);
++
++	if (nm_utils_strv_find_first ((char **) array->pdata, array->len, domain) >= 0) {
++		g_free (copy);
++		return FALSE;
++	}
++
++	g_ptr_array_add (array, copy ?: g_strdup (domain));
++	return TRUE;
++}
++
+ void
+ nm_ip4_config_reset_domains (NMIP4Config *self)
+ {
+@@ -2285,17 +2326,9 @@ void
+ nm_ip4_config_add_domain (NMIP4Config *self, const char *domain)
+ {
+ 	NMIP4ConfigPrivate *priv = NM_IP4_CONFIG_GET_PRIVATE (self);
+-	int i;
+-
+-	g_return_if_fail (domain != NULL);
+-	g_return_if_fail (domain[0] != '\0');
+-
+-	for (i = 0; i < priv->domains->len; i++)
+-		if (!g_strcmp0 (g_ptr_array_index (priv->domains, i), domain))
+-			return;
+ 
+-	g_ptr_array_add (priv->domains, g_strdup (domain));
+-	_notify (self, PROP_DOMAINS);
++	if (_nm_ip_config_check_and_add_domain (priv->domains, domain))
++		_notify (self, PROP_DOMAINS);
+ }
+ 
+ void
+@@ -2339,35 +2372,12 @@ nm_ip4_config_reset_searches (NMIP4Confi
+ }
+ 
+ void
+-nm_ip4_config_add_search (NMIP4Config *self, const char *new)
++nm_ip4_config_add_search (NMIP4Config *self, const char *search)
+ {
+ 	NMIP4ConfigPrivate *priv = NM_IP4_CONFIG_GET_PRIVATE (self);
+-	char *search;
+-	size_t len;
+-
+-	g_return_if_fail (new != NULL);
+-	g_return_if_fail (new[0] != '\0');
+-
+-	search = g_strdup (new);
+-
+-	/* Remove trailing dot as it has no effect */
+-	len = strlen (search);
+-	if (search[len - 1] == '.')
+-		search[len - 1] = 0;
+-
+-	if (!search[0]) {
+-		g_free (search);
+-		return;
+-	}
+-
+-	if (nm_utils_strv_find_first ((char **) priv->searches->pdata,
+-	                               priv->searches->len, search) >= 0) {
+-		g_free (search);
+-		return;
+-	}
+ 
+-	g_ptr_array_add (priv->searches, search);
+-	_notify (self, PROP_SEARCHES);
++	if (_nm_ip_config_check_and_add_domain (priv->searches, search))
++		_notify (self, PROP_SEARCHES);
+ }
+ 
+ void
+@@ -2456,6 +2466,21 @@ nm_ip4_config_get_dns_option (const NMIP
+ 
+ /*****************************************************************************/
+ 
++NMSettingConnectionMdns
++nm_ip4_config_mdns_get (const NMIP4Config *self)
++{
++	return NM_IP4_CONFIG_GET_PRIVATE (self)->mdns;
++}
++
++void
++nm_ip4_config_mdns_set (NMIP4Config *self,
++                        NMSettingConnectionMdns mdns)
++{
++	NM_IP4_CONFIG_GET_PRIVATE (self)->mdns = mdns;
++}
++
++/*****************************************************************************/
++
+ void
+ nm_ip4_config_set_dns_priority (NMIP4Config *self, gint priority)
+ {
+@@ -3065,6 +3090,7 @@ nm_ip4_config_init (NMIP4Config *self)
+ 	nm_ip_config_dedup_multi_idx_type_init ((NMIPConfigDedupMultiIdxType *) &priv->idx_ip4_routes,
+ 	                                        NMP_OBJECT_TYPE_IP4_ROUTE);
+ 
++	priv->mdns = NM_SETTING_CONNECTION_MDNS_DEFAULT;
+ 	priv->nameservers = g_array_new (FALSE, FALSE, sizeof (guint32));
+ 	priv->domains = g_ptr_array_new_with_free_func (g_free);
+ 	priv->searches = g_ptr_array_new_with_free_func (g_free);
+--- network-manager-1.10.6.orig/src/nm-ip4-config.h
++++ network-manager-1.10.6/src/nm-ip4-config.h
+@@ -21,6 +21,8 @@
+ #ifndef __NETWORKMANAGER_IP4_CONFIG_H__
+ #define __NETWORKMANAGER_IP4_CONFIG_H__
+ 
++#include "nm-setting-connection.h"
++
+ #include "nm-exported-object.h"
+ #include "nm-setting-ip4-config.h"
+ 
+@@ -171,6 +173,7 @@ gboolean nm_ip4_config_commit (const NMI
+ 
+ void nm_ip4_config_merge_setting (NMIP4Config *self,
+                                   NMSettingIPConfig *setting,
++                                  NMSettingConnectionMdns mdns,
+                                   guint32 route_table,
+                                   guint32 route_metric);
+ NMSetting *nm_ip4_config_create_setting (const NMIP4Config *self);
+@@ -194,6 +197,10 @@ const NMPObject *_nm_ip4_config_best_def
+ 
+ in_addr_t nmtst_ip4_config_get_gateway (NMIP4Config *config);
+ 
++NMSettingConnectionMdns nm_ip4_config_mdns_get (const NMIP4Config *self);
++void                    nm_ip4_config_mdns_set (NMIP4Config *self,
++                                                NMSettingConnectionMdns mdns);
++
+ const NMDedupMultiHeadEntry *nm_ip4_config_lookup_addresses (const NMIP4Config *self);
+ void nm_ip4_config_reset_addresses (NMIP4Config *self);
+ void nm_ip4_config_add_address (NMIP4Config *self, const NMPlatformIP4Address *address);
+@@ -273,6 +280,8 @@ gboolean nm_ip4_config_nmpobj_remove (NM
+ void nm_ip4_config_hash (const NMIP4Config *self, GChecksum *sum, gboolean dns_only);
+ gboolean nm_ip4_config_equal (const NMIP4Config *a, const NMIP4Config *b);
+ 
++gboolean _nm_ip_config_check_and_add_domain (GPtrArray *array, const char *domain);
++
+ /*****************************************************************************/
+ 
+ #include "nm-ip6-config.h"
+@@ -338,7 +347,7 @@ nm_ip_config_get_addr_family (const NMIP
+ 	g_return_val_if_reached (AF_UNSPEC);
+ }
+ 
+-#define _NM_IP_CONFIG_DISPATCH(config, v4_func, v6_func, dflt, ...) \
++#define _NM_IP_CONFIG_DISPATCH(config, v4_func, v6_func, ...) \
+ 	G_STMT_START { \
+ 		gconstpointer _config = (config); \
+ 		\
+@@ -350,58 +359,88 @@ nm_ip_config_get_addr_family (const NMIP
+ 		} \
+ 	} G_STMT_END
+ 
++#define _NM_IP_CONFIG_DISPATCH_VOID(config, v4_func, v6_func, ...) \
++	G_STMT_START { \
++		gconstpointer _config = (config); \
++		\
++		if (NM_IS_IP4_CONFIG (_config)) { \
++			v4_func ((NMIP4Config *) _config, ##__VA_ARGS__); \
++		} else { \
++			nm_assert (NM_IS_IP6_CONFIG (_config)); \
++			v6_func ((NMIP6Config *) _config, ##__VA_ARGS__); \
++		} \
++	} G_STMT_END
++
++static inline int
++nm_ip_config_get_ifindex (const NMIPConfig *self)
++{
++	_NM_IP_CONFIG_DISPATCH (self, nm_ip4_config_get_ifindex, nm_ip6_config_get_ifindex);
++}
++
++static inline void
++nm_ip_config_hash (const NMIPConfig *self, GChecksum *sum, gboolean dns_only)
++{
++	_NM_IP_CONFIG_DISPATCH_VOID (self, nm_ip4_config_hash, nm_ip6_config_hash, sum, dns_only);
++}
++
+ static inline int
+ nm_ip_config_get_dns_priority (const NMIPConfig *self)
+ {
+-	_NM_IP_CONFIG_DISPATCH (self, nm_ip4_config_get_dns_priority, nm_ip6_config_get_dns_priority, 0);
++	_NM_IP_CONFIG_DISPATCH (self, nm_ip4_config_get_dns_priority, nm_ip6_config_get_dns_priority);
+ }
+ 
+ static inline guint
+ nm_ip_config_get_num_nameservers (const NMIPConfig *self)
+ {
+-	_NM_IP_CONFIG_DISPATCH (self, nm_ip4_config_get_num_nameservers, nm_ip6_config_get_num_nameservers, 0);
++	_NM_IP_CONFIG_DISPATCH (self, nm_ip4_config_get_num_nameservers, nm_ip6_config_get_num_nameservers);
+ }
+ 
+ static inline gconstpointer
+ nm_ip_config_get_nameserver (const NMIPConfig *self, guint i)
+ {
+-	_NM_IP_CONFIG_DISPATCH (self, _nm_ip4_config_get_nameserver, nm_ip6_config_get_nameserver, 0, i);
++	_NM_IP_CONFIG_DISPATCH (self, _nm_ip4_config_get_nameserver, nm_ip6_config_get_nameserver, i);
+ }
+ 
+ static inline guint
+ nm_ip_config_get_num_domains (const NMIPConfig *self)
+ {
+-	_NM_IP_CONFIG_DISPATCH (self, nm_ip4_config_get_num_domains, nm_ip6_config_get_num_domains, 0);
++	_NM_IP_CONFIG_DISPATCH (self, nm_ip4_config_get_num_domains, nm_ip6_config_get_num_domains);
+ }
+ 
+ static inline const char *
+ nm_ip_config_get_domain (const NMIPConfig *self, guint i)
+ {
+-	_NM_IP_CONFIG_DISPATCH (self, nm_ip4_config_get_domain, nm_ip6_config_get_domain, NULL, i);
++	_NM_IP_CONFIG_DISPATCH (self, nm_ip4_config_get_domain, nm_ip6_config_get_domain, i);
+ }
+ 
+ static inline guint
+ nm_ip_config_get_num_searches (const NMIPConfig *self)
+ {
+-	_NM_IP_CONFIG_DISPATCH (self, nm_ip4_config_get_num_searches, nm_ip6_config_get_num_searches, 0);
++	_NM_IP_CONFIG_DISPATCH (self, nm_ip4_config_get_num_searches, nm_ip6_config_get_num_searches);
+ }
+ 
+ static inline const char *
+ nm_ip_config_get_search (const NMIPConfig *self, guint i)
+ {
+-	_NM_IP_CONFIG_DISPATCH (self, nm_ip4_config_get_search, nm_ip6_config_get_search, NULL, i);
++	_NM_IP_CONFIG_DISPATCH (self, nm_ip4_config_get_search, nm_ip6_config_get_search, i);
+ }
+ 
+ static inline guint
+ nm_ip_config_get_num_dns_options (const NMIPConfig *self)
+ {
+-	_NM_IP_CONFIG_DISPATCH (self, nm_ip4_config_get_num_dns_options, nm_ip6_config_get_num_dns_options, 0);
++	_NM_IP_CONFIG_DISPATCH (self, nm_ip4_config_get_num_dns_options, nm_ip6_config_get_num_dns_options);
+ }
+ 
+ static inline const char *
+ nm_ip_config_get_dns_option (const NMIPConfig *self, guint i)
+ {
+-	_NM_IP_CONFIG_DISPATCH (self, nm_ip4_config_get_dns_option, nm_ip6_config_get_dns_option, NULL, i);
++	_NM_IP_CONFIG_DISPATCH (self, nm_ip4_config_get_dns_option, nm_ip6_config_get_dns_option, i);
++}
++
++static inline const NMPObject *
++nm_ip_config_best_default_route_get (const NMIPConfig *self)
++{
++	_NM_IP_CONFIG_DISPATCH (self, nm_ip4_config_best_default_route_get, nm_ip6_config_best_default_route_get);
+ }
+ 
+ #endif /* __NETWORKMANAGER_IP4_CONFIG_H__ */
+--- network-manager-1.10.6.orig/src/nm-ip6-config.c
++++ network-manager-1.10.6/src/nm-ip6-config.c
+@@ -2054,17 +2054,9 @@ void
+ nm_ip6_config_add_domain (NMIP6Config *self, const char *domain)
+ {
+ 	NMIP6ConfigPrivate *priv = NM_IP6_CONFIG_GET_PRIVATE (self);
+-	int i;
+ 
+-	g_return_if_fail (domain != NULL);
+-	g_return_if_fail (domain[0] != '\0');
+-
+-	for (i = 0; i < priv->domains->len; i++)
+-		if (!g_strcmp0 (g_ptr_array_index (priv->domains, i), domain))
+-			return;
+-
+-	g_ptr_array_add (priv->domains, g_strdup (domain));
+-	_notify (self, PROP_DOMAINS);
++	if (_nm_ip_config_check_and_add_domain (priv->domains, domain))
++		_notify (self, PROP_DOMAINS);
+ }
+ 
+ void
+@@ -2108,35 +2100,12 @@ nm_ip6_config_reset_searches (NMIP6Confi
+ }
+ 
+ void
+-nm_ip6_config_add_search (NMIP6Config *self, const char *new)
++nm_ip6_config_add_search (NMIP6Config *self, const char *search)
+ {
+ 	NMIP6ConfigPrivate *priv = NM_IP6_CONFIG_GET_PRIVATE (self);
+-	char *search;
+-	size_t len;
+-
+-	g_return_if_fail (new != NULL);
+-	g_return_if_fail (new[0] != '\0');
+-
+-	search = g_strdup (new);
+ 
+-	/* Remove trailing dot as it has no effect */
+-	len = strlen (search);
+-	if (search[len - 1] == '.')
+-		search[len - 1] = 0;
+-
+-	if (!search[0]) {
+-		g_free (search);
+-		return;
+-	}
+-
+-	if (nm_utils_strv_find_first ((char **) priv->searches->pdata,
+-	                               priv->searches->len, search) >= 0) {
+-		g_free (search);
+-		return;
+-	}
+-
+-	g_ptr_array_add (priv->searches, search);
+-	_notify (self, PROP_SEARCHES);
++	if (_nm_ip_config_check_and_add_domain (priv->searches, search))
++		_notify (self, PROP_SEARCHES);
+ }
+ 
+ void
+--- network-manager-1.10.6.orig/src/nm-policy.c
++++ network-manager-1.10.6/src/nm-policy.c
+@@ -1065,22 +1065,19 @@ update_ip_dns (NMPolicy *self, int addr_
+ 	gpointer ip_config;
+ 	const char *ip_iface = NULL;
+ 	NMVpnConnection *vpn = NULL;
+-	NMDnsIPConfigType dns_type = NM_DNS_IP_CONFIG_TYPE_BEST_DEVICE;
+ 
+ 	nm_assert_addr_family (addr_family);
+ 
+ 	ip_config = get_best_ip_config (self, addr_family, &ip_iface, NULL, NULL, &vpn);
+ 	if (ip_config) {
+-		if (vpn)
+-			dns_type = NM_DNS_IP_CONFIG_TYPE_VPN;
+-
+ 		/* Tell the DNS manager this config is preferred by re-adding it with
+ 		 * a different IP config type.
+ 		 */
+-		nm_dns_manager_add_ip_config (NM_POLICY_GET_PRIVATE (self)->dns_manager,
+-		                              ip_iface,
++		nm_dns_manager_set_ip_config (NM_POLICY_GET_PRIVATE (self)->dns_manager,
+ 		                              ip_config,
+-		                              dns_type);
++		                              vpn
++		                                ? NM_DNS_IP_CONFIG_TYPE_VPN
++		                                : NM_DNS_IP_CONFIG_TYPE_BEST_DEVICE);
+ 	}
+ 
+ 	if (addr_family == AF_INET6)
+@@ -1711,7 +1708,6 @@ device_state_changed (NMDevice *device,
+ 	NMPolicy *self = _PRIV_TO_SELF (priv);
+ 	NMActiveConnection *ac;
+ 	NMSettingsConnection *connection = nm_device_get_settings_connection (device);
+-	const char *ip_iface = nm_device_get_ip_iface (device);
+ 	NMIP4Config *ip4_config;
+ 	NMIP6Config *ip6_config;
+ 	NMSettingConnection *s_con = NULL;
+@@ -1808,10 +1804,10 @@ device_state_changed (NMDevice *device,
+ 
+ 		ip4_config = nm_device_get_ip4_config (device);
+ 		if (ip4_config)
+-			nm_dns_manager_add_ip_config (priv->dns_manager, ip_iface, ip4_config, NM_DNS_IP_CONFIG_TYPE_DEFAULT);
++			nm_dns_manager_set_ip_config (priv->dns_manager, NM_IP_CONFIG_CAST (ip4_config), NM_DNS_IP_CONFIG_TYPE_DEFAULT);
+ 		ip6_config = nm_device_get_ip6_config (device);
+ 		if (ip6_config)
+-			nm_dns_manager_add_ip_config (priv->dns_manager, ip_iface, ip6_config, NM_DNS_IP_CONFIG_TYPE_DEFAULT);
++			nm_dns_manager_set_ip_config (priv->dns_manager, NM_IP_CONFIG_CAST (ip6_config), NM_DNS_IP_CONFIG_TYPE_DEFAULT);
+ 
+ 		update_routing_and_dns (self, FALSE);
+ 
+@@ -1904,50 +1900,24 @@ device_state_changed (NMDevice *device,
+ }
+ 
+ static void
+-device_ip4_config_changed (NMDevice *device,
+-                           NMIP4Config *new_config,
+-                           NMIP4Config *old_config,
+-                           gpointer user_data)
++device_ip_config_changed (NMDevice *device,
++                          NMIPConfig *new_config,
++                          NMIPConfig *old_config,
++                          gpointer user_data)
+ {
+ 	NMPolicyPrivate *priv = user_data;
+ 	NMPolicy *self = _PRIV_TO_SELF (priv);
+-	const char *ip_iface = nm_device_get_ip_iface (device);
+-
+-	nm_dns_manager_begin_updates (priv->dns_manager, __func__);
+-
+-	/* We catch already all the IP events registering on the device state changes but
+-	 * the ones where the IP changes but the device state keep stable (i.e., activated):
+-	 * ignore IP config changes but when the device is in activated state.
+-	 * Prevents unecessary changes to DNS information.
+-	 */
+-	if (nm_device_get_state (device) == NM_DEVICE_STATE_ACTIVATED) {
+-		if (old_config != new_config) {
+-			if (old_config)
+-				nm_dns_manager_remove_ip_config (priv->dns_manager, old_config);
+-			if (new_config)
+-				nm_dns_manager_add_ip_config (priv->dns_manager, ip_iface, new_config, NM_DNS_IP_CONFIG_TYPE_DEFAULT);
+-		}
+-		update_ip_dns (self, AF_INET);
+-		update_ip4_routing (self, TRUE);
+-		update_system_hostname (self, "ip4 conf");
+-	} else {
+-		/* Old configs get removed immediately */
+-		if (old_config)
+-			nm_dns_manager_remove_ip_config (priv->dns_manager, old_config);
+-	}
++	int addr_family;
+ 
+-	nm_dns_manager_end_updates (priv->dns_manager, __func__);
+-}
+-
+-static void
+-device_ip6_config_changed (NMDevice *device,
+-                           NMIP6Config *new_config,
+-                           NMIP6Config *old_config,
+-                           gpointer user_data)
+-{
+-	NMPolicyPrivate *priv = user_data;
+-	NMPolicy *self = _PRIV_TO_SELF (priv);
+-	const char *ip_iface = nm_device_get_ip_iface (device);
++	nm_assert (new_config || old_config);
++	nm_assert (!new_config || NM_IS_IP_CONFIG (new_config));
++	nm_assert (!old_config || NM_IS_IP_CONFIG (old_config));
++
++	if (new_config) {
++		addr_family = nm_ip_config_get_addr_family (new_config);
++		nm_assert (!old_config || addr_family == nm_ip_config_get_addr_family (old_config));
++	} else
++		addr_family = nm_ip_config_get_addr_family (old_config);
+ 
+ 	nm_dns_manager_begin_updates (priv->dns_manager, __func__);
+ 
+@@ -1958,18 +1928,24 @@ device_ip6_config_changed (NMDevice *dev
+ 	 */
+ 	if (nm_device_get_state (device) == NM_DEVICE_STATE_ACTIVATED) {
+ 		if (old_config != new_config) {
+-			if (old_config)
+-				nm_dns_manager_remove_ip_config (priv->dns_manager, old_config);
+ 			if (new_config)
+-				nm_dns_manager_add_ip_config (priv->dns_manager, ip_iface, new_config, NM_DNS_IP_CONFIG_TYPE_DEFAULT);
++				nm_dns_manager_set_ip_config (priv->dns_manager, new_config, NM_DNS_IP_CONFIG_TYPE_DEFAULT);
++			if (old_config)
++				nm_dns_manager_set_ip_config (priv->dns_manager, old_config, NM_DNS_IP_CONFIG_TYPE_REMOVED);
+ 		}
+-		update_ip_dns (self, AF_INET6);
+-		update_ip6_routing (self, TRUE);
+-		update_system_hostname (self, "ip6 conf");
++		update_ip_dns (self, addr_family);
++		if (addr_family == AF_INET)
++			update_ip4_routing (self, TRUE);
++		else
++			update_ip6_routing (self, TRUE);
++		update_system_hostname (self,
++		                        addr_family == AF_INET
++		                          ? "ip4 conf"
++		                          : "ip6 conf");
+ 	} else {
+ 		/* Old configs get removed immediately */
+ 		if (old_config)
+-			nm_dns_manager_remove_ip_config (priv->dns_manager, old_config);
++			nm_dns_manager_set_ip_config (priv->dns_manager, old_config, NM_DNS_IP_CONFIG_TYPE_REMOVED);
+ 	}
+ 
+ 	nm_dns_manager_end_updates (priv->dns_manager, __func__);
+@@ -2012,8 +1988,8 @@ devices_list_register (NMPolicy *self, N
+ 
+ 	/* Connect state-changed with _after, so that the handler is invoked after other handlers. */
+ 	g_signal_connect_after (device, NM_DEVICE_STATE_CHANGED,          (GCallback) device_state_changed, priv);
+-	g_signal_connect       (device, NM_DEVICE_IP4_CONFIG_CHANGED,     (GCallback) device_ip4_config_changed, priv);
+-	g_signal_connect       (device, NM_DEVICE_IP6_CONFIG_CHANGED,     (GCallback) device_ip6_config_changed, priv);
++	g_signal_connect       (device, NM_DEVICE_IP4_CONFIG_CHANGED,     (GCallback) device_ip_config_changed, priv);
++	g_signal_connect       (device, NM_DEVICE_IP6_CONFIG_CHANGED,     (GCallback) device_ip_config_changed, priv);
+ 	g_signal_connect       (device, NM_DEVICE_IP6_PREFIX_DELEGATED,   (GCallback) device_ip6_prefix_delegated, priv);
+ 	g_signal_connect       (device, NM_DEVICE_IP6_SUBNET_NEEDED,      (GCallback) device_ip6_subnet_needed, priv);
+ 	g_signal_connect       (device, "notify::" NM_DEVICE_AUTOCONNECT, (GCallback) device_autoconnect_changed, priv);
+@@ -2068,21 +2044,16 @@ vpn_connection_activated (NMPolicy *self
+ 	NMPolicyPrivate *priv = NM_POLICY_GET_PRIVATE (self);
+ 	NMIP4Config *ip4_config;
+ 	NMIP6Config *ip6_config;
+-	const char *ip_iface;
+ 
+ 	nm_dns_manager_begin_updates (priv->dns_manager, __func__);
+ 
+-	ip_iface = nm_vpn_connection_get_ip_iface (vpn, TRUE);
+-
+-	/* Add the VPN connection's IP configs from DNS */
+-
+ 	ip4_config = nm_vpn_connection_get_ip4_config (vpn);
+ 	if (ip4_config)
+-		nm_dns_manager_add_ip_config (priv->dns_manager, ip_iface, ip4_config, NM_DNS_IP_CONFIG_TYPE_VPN);
++		nm_dns_manager_set_ip_config (priv->dns_manager, NM_IP_CONFIG_CAST (ip4_config), NM_DNS_IP_CONFIG_TYPE_VPN);
+ 
+ 	ip6_config = nm_vpn_connection_get_ip6_config (vpn);
+ 	if (ip6_config)
+-		nm_dns_manager_add_ip_config (priv->dns_manager, ip_iface, ip6_config, NM_DNS_IP_CONFIG_TYPE_VPN);
++		nm_dns_manager_set_ip_config (priv->dns_manager, NM_IP_CONFIG_CAST (ip6_config), NM_DNS_IP_CONFIG_TYPE_VPN);
+ 
+ 	update_routing_and_dns (self, TRUE);
+ 
+@@ -2099,16 +2070,12 @@ vpn_connection_deactivated (NMPolicy *se
+ 	nm_dns_manager_begin_updates (priv->dns_manager, __func__);
+ 
+ 	ip4_config = nm_vpn_connection_get_ip4_config (vpn);
+-	if (ip4_config) {
+-		/* Remove the VPN connection's IP4 config from DNS */
+-		nm_dns_manager_remove_ip_config (priv->dns_manager, ip4_config);
+-	}
++	if (ip4_config)
++		nm_dns_manager_set_ip_config (priv->dns_manager, NM_IP_CONFIG_CAST (ip4_config), NM_DNS_IP_CONFIG_TYPE_REMOVED);
+ 
+ 	ip6_config = nm_vpn_connection_get_ip6_config (vpn);
+-	if (ip6_config) {
+-		/* Remove the VPN connection's IP6 config from DNS */
+-		nm_dns_manager_remove_ip_config (priv->dns_manager, ip6_config);
+-	}
++	if (ip6_config)
++		nm_dns_manager_set_ip_config (priv->dns_manager, NM_IP_CONFIG_CAST (ip6_config), NM_DNS_IP_CONFIG_TYPE_REMOVED);
+ 
+ 	update_routing_and_dns (self, TRUE);
+ 
+--- network-manager-1.10.6.orig/src/nm-types.h
++++ network-manager-1.10.6/src/nm-types.h
+@@ -231,4 +231,6 @@ typedef struct _NMSettingsConnection NMS
+ /* utils */
+ typedef struct _NMUtilsIPv6IfaceId   NMUtilsIPv6IfaceId;
+ 
++#define NM_SETTING_CONNECTION_MDNS_UNKNOWN ((NMSettingConnectionMdns) -42)
++
+ #endif  /* NM_TYPES_H */
+--- network-manager-1.10.6.orig/src/settings/plugins/ifcfg-rh/nms-ifcfg-rh-reader.c
++++ network-manager-1.10.6/src/settings/plugins/ifcfg-rh/nms-ifcfg-rh-reader.c
+@@ -181,7 +181,7 @@ make_connection_setting (const char *fil
+ 	const char *v;
+ 	gs_free char *stable_id = NULL;
+ 	const char *const *iter;
+-	int vint64;
++	int vint64, i_val;
+ 
+ 	ifcfg_name = utils_get_ifcfg_name (file, TRUE);
+ 	if (!ifcfg_name)
+@@ -338,6 +338,13 @@ make_connection_setting (const char *fil
+ 	vint64 = svGetValueInt64 (ifcfg, "AUTH_RETRIES", 10, -1, G_MAXINT32, -1);
+ 	g_object_set (s_con, NM_SETTING_CONNECTION_AUTH_RETRIES, (gint) vint64, NULL);
+ 
++	i_val = NM_SETTING_CONNECTION_MDNS_DEFAULT;
++	if (!svGetValueEnum (ifcfg, "MDNS",
++	                     nm_setting_connection_mdns_get_type (),
++	                     &i_val, NULL))
++		PARSE_WARNING ("invalid MDNS setting");
++	g_object_set (s_con, NM_SETTING_CONNECTION_MDNS, i_val, NULL);
++
+ 	return NM_SETTING (s_con);
+ }
+ 
+--- network-manager-1.10.6.orig/src/settings/plugins/ifcfg-rh/nms-ifcfg-rh-writer.c
++++ network-manager-1.10.6/src/settings/plugins/ifcfg-rh/nms-ifcfg-rh-writer.c
+@@ -1728,6 +1728,7 @@ write_connection_setting (NMSettingConne
+ 	GString *str;
+ 	const char *master, *master_iface = NULL, *type;
+ 	gint vint;
++	NMSettingConnectionMdns mdns;
+ 	guint32 vuint32;
+ 	const char *tmp;
+ 
+@@ -1888,6 +1889,13 @@ write_connection_setting (NMSettingConne
+ 
+ 	vint = nm_setting_connection_get_auth_retries (s_con);
+ 	svSetValueInt64_cond (ifcfg, "AUTH_RETRIES", vint >= 0, vint);
++
++	mdns = nm_setting_connection_get_mdns (s_con);
++	if (mdns != NM_SETTING_CONNECTION_MDNS_DEFAULT) {
++		svSetValueEnum (ifcfg, "MDNS", nm_setting_connection_mdns_get_type (),
++		                mdns);
++	} else
++		svUnsetValue (ifcfg, "MDNS");
+ }
+ 
+ static char *
+@@ -3188,4 +3196,3 @@ nms_ifcfg_rh_writer_can_write_connection
+ 	             NM_PRINT_FMT_QUOTE_STRING (type));
+ 	return FALSE;
+ }
+-
+--- network-manager-1.10.6.orig/src/tests/test-ip4-config.c
++++ network-manager-1.10.6/src/tests/test-ip4-config.c
+@@ -319,11 +319,15 @@ test_strip_search_trailing_dot (void)
+ 	nm_ip4_config_add_search (config, "bar.");
+ 	nm_ip4_config_add_search (config, "baz.com");
+ 	nm_ip4_config_add_search (config, "baz.com.");
++	nm_ip4_config_add_search (config, "foobar..");
++	nm_ip4_config_add_search (config, ".foobar");
++	nm_ip4_config_add_search (config, "~.");
+ 
+-	g_assert_cmpuint (nm_ip4_config_get_num_searches (config), ==, 3);
++	g_assert_cmpuint (nm_ip4_config_get_num_searches (config), ==, 4);
+ 	g_assert_cmpstr (nm_ip4_config_get_search (config, 0), ==, "foo");
+ 	g_assert_cmpstr (nm_ip4_config_get_search (config, 1), ==, "bar");
+ 	g_assert_cmpstr (nm_ip4_config_get_search (config, 2), ==, "baz.com");
++	g_assert_cmpstr (nm_ip4_config_get_search (config, 3), ==, "~");
+ 
+ 	g_object_unref (config);
+ }
+--- network-manager-1.10.6.orig/src/tests/test-ip6-config.c
++++ network-manager-1.10.6/src/tests/test-ip6-config.c
+@@ -338,11 +338,15 @@ test_strip_search_trailing_dot (void)
+ 	nm_ip6_config_add_search (config, "bar.");
+ 	nm_ip6_config_add_search (config, "baz.com");
+ 	nm_ip6_config_add_search (config, "baz.com.");
++	nm_ip6_config_add_search (config, "foobar..");
++	nm_ip6_config_add_search (config, ".foobar");
++	nm_ip6_config_add_search (config, "~.");
+ 
+-	g_assert_cmpuint (nm_ip6_config_get_num_searches (config), ==, 3);
++	g_assert_cmpuint (nm_ip6_config_get_num_searches (config), ==, 4);
+ 	g_assert_cmpstr (nm_ip6_config_get_search (config, 0), ==, "foo");
+ 	g_assert_cmpstr (nm_ip6_config_get_search (config, 1), ==, "bar");
+ 	g_assert_cmpstr (nm_ip6_config_get_search (config, 2), ==, "baz.com");
++	g_assert_cmpstr (nm_ip6_config_get_search (config, 3), ==, "~");
+ 
+ 	g_object_unref (config);
+ }
+--- network-manager-1.10.6.orig/src/vpn/nm-vpn-connection.c
++++ network-manager-1.10.6/src/vpn/nm-vpn-connection.c
+@@ -1460,6 +1460,7 @@ nm_vpn_connection_ip4_config_get (NMVpnC
+ 	NMPlatformIP4Address address;
+ 	guint32 u32, route_metric;
+ 	NMSettingIPConfig *s_ip;
++	NMSettingConnection *s_con;
+ 	guint32 route_table;
+ 	NMIP4Config *config;
+ 	GVariantIter *iter;
+@@ -1564,6 +1565,7 @@ nm_vpn_connection_ip4_config_get (NMVpnC
+ 	route_table = get_route_table (self, AF_INET, TRUE);
+ 	route_metric = nm_vpn_connection_get_ip4_route_metric (self);
+ 	s_ip = nm_connection_get_setting_ip4_config (_get_applied_connection (self));
++	s_con = nm_connection_get_setting_connection (_get_applied_connection (self));
+ 
+ 	if (nm_setting_ip_config_get_ignore_auto_routes (s_ip)) {
+ 		/* ignore VPN routes */
+@@ -1621,6 +1623,7 @@ nm_vpn_connection_ip4_config_get (NMVpnC
+ 	/* Merge in user overrides from the NMConnection's IPv4 setting */
+ 	nm_ip4_config_merge_setting (config,
+ 	                             s_ip,
++	                             nm_setting_connection_get_mdns (s_con),
+ 	                             route_table,
+ 	                             route_metric);
+ 

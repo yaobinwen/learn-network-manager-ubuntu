@@ -1,0 +1,36 @@
+Description: manager: retry activating devices when the parent becomes managed
+ Since commit ed640f85 ("manager: ignore unmanaged devices when
+ looking for parent by UUID"), unmanaged devices are ignored when
+ looking for potential parent connection matches. Therefore, a software
+ device can fail autoactivation because the parent is not managed yet
+ and NM never tries to reactivate it. Ensure that we retry other
+ devices when a parent device becomes managed.
+ .
+ network-manager (1.10.6-2ubuntu1.2) bionic; urgency=medium
+ .
+   [ Till Kamppeter ]
+   * debian/tests/nm: Add gi.require_version() calls for NetworkManager
+     and NMClient to avoid stderr output which fails the test. (LP: #1825946)
+   [ Dariusz Gadomski ]
+   * d/p/fix-dns-leak-lp1754671.patch: backport of DNS leak fix. (LP: #1754671)
+   * d/p/lp1790098.patch: retry activating devices when the parent becomes
+     managed. (LP: #1790098)
+Origin: upstream, https://gitlab.freedesktop.org/NetworkManager/NetworkManager/commit/34ca1680
+Bug: https://bugzilla.redhat.com/show_bug.cgi?id=1553595
+Bug-Ubuntu: https://bugs.launchpad.net/bugs/1754671
+Bug-Ubuntu: https://bugs.launchpad.net/bugs/1790098
+Bug-Ubuntu: https://bugs.launchpad.net/bugs/1825946
+
+--- network-manager-1.10.6.orig/src/nm-manager.c
++++ network-manager-1.10.6/src/nm-manager.c
+@@ -1212,6 +1212,10 @@ manager_device_state_changed (NMDevice *
+ 	NMManager *self = NM_MANAGER (user_data);
+ 	NMManagerPrivate *priv = NM_MANAGER_GET_PRIVATE (self);
+ 
++	if (   old_state == NM_DEVICE_STATE_UNMANAGED
++	    && new_state > NM_DEVICE_STATE_UNMANAGED)
++		retry_connections_for_parent_device (self, device);
++
+ 	switch (new_state) {
+ 	case NM_DEVICE_STATE_UNMANAGED:
+ 	case NM_DEVICE_STATE_UNAVAILABLE:
